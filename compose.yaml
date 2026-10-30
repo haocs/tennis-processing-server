@@ -1,0 +1,39 @@
+services:
+  processing:
+    image: ${PROCESSING_IMAGE:?Set the published image digest}
+    user: "${PROCESSING_UID:-10001}:${PROCESSING_GID:-10001}"
+    restart: unless-stopped
+    ports:
+      - "${PROCESSING_BIND:-127.0.0.1}:8766:8000"
+    environment:
+      PROCESSING_CONFIG: /config/server.json
+      HOME: /tmp
+    volumes:
+      - type: bind
+        source: ${PROCESSING_CONFIG_FILE:?Set private server config path}
+        target: /config/server.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PROCESSING_ORIGINALS:?Set private original folder}
+        target: /originals
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PROCESSING_STORAGE:?Set library root including its hidden processing staging folder}
+        target: /tennis
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PROCESSING_DATA:?Set native state folder}
+        target: /data
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s

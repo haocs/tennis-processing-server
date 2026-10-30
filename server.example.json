@@ -1,0 +1,9 @@
+{
+  "data_dir": "/data",
+  "registration_token": "REPLACE_WITH_A_PRIVATE_RANDOM_TOKEN",
+  "storage": {
+    "originals": {"path": "/originals"},
+    "processing": {"path": "/tennis/.processing"},
+    "library": {"path": "/tennis"}
+  }
+}

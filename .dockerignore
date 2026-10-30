@@ -1,0 +1,14 @@
+**
+!Dockerfile
+!requirements.txt
+!app.py
+!store.py
+!files.py
+!scheduler.py
+!start.py
+!static/
+!static/*
+!templates/
+!templates/*
+!legacy.py
+!manage.py

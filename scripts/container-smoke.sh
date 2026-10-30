@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+image="$1"
+fixture=$(mktemp -d)
+container="processing-smoke-$$"
+trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT
+mkdir -p "$fixture/data" "$fixture/tennis/.processing" "$fixture/originals"
+cp server.example.json "$fixture/server.json"
+chmod -R a+rwX "$fixture"
+docker run -d --name "$container" --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true -p 127.0.0.1::8000 -v "$fixture/server.json:/config/server.json:ro" -v "$fixture/data:/data" -v "$fixture/originals:/originals:ro" -v "$fixture/tennis:/tennis" "$image"
+for i in {1..30}; do
+  if docker exec "$container" python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"; then break; fi
+  sleep 1
+done
+docker exec "$container" python -c "import urllib.request,json; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/v1/readyz'))['database']"
+docker restart "$container"
+for i in {1..30}; do
+  if docker exec "$container" python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"; then break; fi
+  sleep 1
+done
+docker exec "$container" python -c "import sqlite3; assert sqlite3.connect('/data/processing.sqlite3').execute('pragma integrity_check').fetchone()[0]=='ok'"

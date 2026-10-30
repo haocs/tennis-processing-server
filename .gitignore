@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+config.json
+server.json
+.env
+.state/
+*.sqlite3*
+*.log

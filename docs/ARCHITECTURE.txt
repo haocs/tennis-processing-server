@@ -1,0 +1,404 @@
+TENNIS PROCESSING V2 — ARCHITECTURE AND API PROPOSAL
+2026-10-30 · Design only · Not implemented
+
+1. TWO MAIN PARTS
+
+NAS: one Docker application, “Processing Server”
+- JSON API, scheduler, input-folder scanner and control portal in one application.
+- Owns sources, immutable task specifications, attempts, leases, worker registry,
+  task events, timing history and publication decisions.
+- Persistent SQLite database on a native Docker volume/local NAS filesystem,
+  not a database opened over SMB. One server instance initially. Transactions
+  serialize claims/updates from multiple workers and portal visitors.
+- Scheduler/scanner run once under a leader lock, not once per HTTP process.
+- Can later replace SQLite with PostgreSQL without changing the worker protocol.
+
+Mac now, Windows later: “Processing Worker”
+- Outbound HTTP connection to the server; server need not reach worker ports.
+- Resolves logical NAS references through machine-specific mount mappings.
+- Executes a task as a series of recoverable local stages in scratch storage.
+- No authoritative queue/history or embedded scheduling decisions.
+- Local JSON state + validated stage cache are disposable recovery aids. Losing
+  them costs work, but never loses server task history or licenses a stale task.
+- OS adapters handle launchd on Mac, a Windows service later, mount checks,
+  encoders and compute backends. Core task execution does not depend on launchd.
+
+Data flow:
+
+  Portal/manual request ----\
+                            > Processing Server <--- heartbeat/claim/events --- Worker
+  NAS input-folder scan ---/        |                                      /    |
+                                    | task/result metadata                /     | local stages
+                                    v                                    /      v
+                            NAS state + history                 NAS blobs   local cache
+                                    |
+                            activate verified result
+                                    v
+                            existing viewing website
+
+The viewing website remains its own Docker application. Its likes, court names
+and review UI remain separate from processing-server state and the control portal.
+No changes to the existing running pipeline are part of this design document.
+
+2. STORAGE IS LOGICAL, NOT A MAC/WINDOWS PATH
+
+Example file reference sent through the API:
+  {"storage_id":"originals","path":"2026/session/video.mov",
+   "sha256":"<64 hex characters>","bytes":123456789}
+
+Each installation maps the storage IDs independently:
+- originals: private input root; workers read, never move/delete/modify originals.
+- processing: run artifacts, checkpoints and experiments; isolated from library.
+- library: published media/metadata, accessible to the viewing application.
+
+For example, “originals” can resolve to a Mac mounted folder, Windows UNC share,
+or a Docker bind mount. Actual paths and credentials stay in private deployment
+configuration, never in public source or portable task specifications.
+
+A storage root has an identity marker. Reject wrong/missing mounts, absolute or
+traversing relative paths, and symlink escapes. APIs do not accept arbitrary URLs.
+A small manifest uses JSON through the API; video, pose traces, models, large logs
+and evaluation datasets use referenced files on NAS. No video upload API.
+
+Suggested layout, all configurable:
+  processing/runs/<task-id>/<attempt-id>/...
+  processing/checkpoints/<task-id>/<attempt-id>/...
+  processing/experiments/<task-id>/<attempt-id>/...
+  processing/worker-state/<worker-id>.json       (server-generated mirror)
+  library/media/... and library/metadata/...    (existing viewing contract)
+  server-state/processing.sqlite3 + backups     (native persistent volume)
+
+Access boundaries: workers have read access to originals/models and write access
+to their processing staging area, but NO write access to the active library. The
+server publisher has library write access. The viewing website retains library
+read-only access. Enforce these boundaries with NAS accounts/mount permissions;
+a protocol convention alone cannot prevent an obsolete worker overwriting files.
+
+Processing reports do not contain credentials, private host mount paths or GPS
+unless a specific artifact needs recording metadata. The portal need not expose
+private original-file paths to ordinary viewing-site visitors.
+
+3. TASKS, ATTEMPTS AND RESULTS
+
+Source: stable logical identity, storage reference, content hash when verified,
+size, original recording metadata and observation history.
+
+Task: immutable request: source, task type, pipeline build/digest, algorithm/model
+references + hashes, parameter snapshot/hash, requested stages, priority,
+publication policy, creation trigger and optional parent task ID.
+
+Attempt: one execution of a task: worker, attempt number, unique lease token,
+lease expiry, stage events, checkpoints, timing, error code, result reference.
+Retries create attempts under the SAME task. A rerun creates a NEW task linked to
+its parent; do not edit the old task or replace historical outputs.
+
+Result: immutable artifact manifest tied to task, attempt, source digest,
+algorithm/model/config versions and checksums. Active library publication is a
+separate decision, not the result identity.
+
+Task types:
+- process: full processing, attempt-scoped NAS artifacts and optional activation
+  in the viewing library. First automatic process may publish when no active
+  result exists; a manual rerun defaults to keeping its result for review.
+- dryrun: execute preparation, detection and local exports/validation if those
+  stages are requested, but write NO worker media/checkpoints/results/log files
+  to NAS. Small findings and timing summary go through the API. Output retention
+  is local and temporary. Large local findings are identified as local-only.
+- experiment: isolated NAS experiment artifacts, optionally dataset/evaluation
+  references. NEVER activate in the viewing library implicitly. Training and
+  experimental algorithms are future executors, not part of the first release.
+
+Dryrun clarification: “no NAS side effects” means no processing-artifact or
+library writes by the worker. The server still persists task history and worker
+state on NAS; otherwise it could not record a dry run as requested. The server
+also mirrors the small worker snapshot. A truly zero-write NAS mode would be a
+different, disconnected local command and is not this task type.
+
+Task states:
+  queued -> leased -> running -> succeeded | failed | cancelled
+  transient failure / lost lease -> retry_wait -> queued
+  cancel request -> cancel_requested -> cancelled (or succeeded if completion won
+  the transaction first; a cancelled task is never automatically activated).
+
+Attempt states:
+  leased -> running -> succeeded | failed | cancelled | lost
+
+Publication states, separate from task execution:
+  not_requested | pending | active | superseded | failed
+A valid completed result can exist even if library activation fails. Retrying
+publication does not rerun video analysis. A succeeded old run remains in history
+when a newer one becomes active.
+
+4. STAGES AND RECOVERY
+
+Initial fixed stage graph:
+  acquire_source -> verify_source -> prepare_proxy -> analyze -> plan_process
+  -> process (render clips, combine and verify) -> package_result
+  -> upload_result -> clean_scratch
+
+“acquire_source” includes copying to local scratch; “verify_source” hashes that
+copy and verifies the expected identity/signature. NAS source mutation checks
+remain part of final validation. Publication is owned by the server, after the
+worker has completed the requested stages.
+
+Every stage records pending/running/succeeded/failed/skipped, start/finish times,
+monotonic elapsed seconds, progress, input fingerprint and output references.
+A stage fingerprint includes source digest, relevant parameters, pipeline/model
+version and upstream artifact digests. Validate checkpoints before reuse.
+Changing the algorithm invalidates analysis and downstream stages; changing only
+export settings can reuse a compatible cut plan. The first release can conservatively
+invalidate more stages rather than incorrectly reusing work.
+
+Worker state file: schema version, worker ID, server address, current task/attempt,
+lease expiry, last acknowledged event sequence, stage and checkpoint manifest.
+Atomic replacement on stage changes; heartbeat reports the small current snapshot.
+Credentials live separately and are NEVER included in mirrored worker state.
+
+Server materializes the latest acknowledged snapshot in NAS worker-state storage.
+Do not infer a live lease from this mirror; server database is authoritative.
+Reinstall/new worker ID does not inherit the old worker's lease.
+
+Local checkpoints are preferred. Normal/experiment tasks may also write immutable
+checkpoints into their own attempt directory. Another worker may reuse verified,
+portable checkpoints authorized in a new lease; encoder/model runtime compatibility
+must match. Dryrun checkpoints remain local only.
+
+Restart/recovery:
+- Worker reconciles its local attempt with server before doing any further work.
+- Valid same-owner lease: renew and resume after checking cached artifacts.
+- Expired/reassigned lease: stop execution and submit checkpoint candidates only
+  as references; server decides whether a new attempt may reuse them.
+- Treat a power-killed stage as interrupted, not successful. Retry that stage.
+- Losing cache restarts necessary stages; originals and prior results stay intact.
+- No “exactly once” promise: computation may repeat after failure; canonical
+  publication must be fenced and idempotent.
+
+5. LEASES, HEARTBEAT AND CONCURRENT UPDATES
+
+Initial policy: one active task per worker; worker advertises capacity and supported
+executors/backends. Server claims in a transaction by priority then queued time,
+matching capabilities and current storage access. No fixed worker assignment.
+Future capacity can distinguish compute slots and transfer slots.
+
+Heartbeat every 15 seconds; task lease TTL 90 seconds. Every heartbeat renews the
+active lease only after validating worker ID + attempt ID + token. Progress/event
+traffic does not silently extend a lease. Server time determines expiry.
+A fresh heartbeat with unchanged progress is “alive, slow/stalled”, not healthy
+progress. Each stage gets a configurable stall threshold; do not kill a long
+export solely because percentage information is unavailable.
+
+Worker must suspend work on lease expiry and cannot begin new NAS writes then.
+In-flight writes may finish only into that attempt's staging directory. During
+network partition it cannot commit/publish anything to the active library.
+Expired attempts are marked lost; server retries with a NEW token. All mutation
+requests with the old token return 409 stale_lease. This prevents double ownership.
+
+Worker artifacts are immutable and attempt-scoped. The SERVER alone changes the
+active viewing-library pointer. A stale worker therefore cannot replace live media.
+Use row versions/expected_version on portal edits and activation. Multiple visitors
+can inspect/trigger jobs; stale conflicting edits return 409 instead of overwriting.
+
+6. JSON API V1 — PROPOSED MINIMUM
+
+All routes below are under /api/v1. JSON metadata only; UTC RFC3339 timestamps,
+opaque IDs, integer versions, seconds for durations. Payload limit initially 256 KiB;
+reference a NAS JSON/blob for larger data. Mutations use Idempotency-Key so network
+retries return the same operation. Reusing a key with a different body is a 409.
+Worker identity must be bound to its requests; LAN deployment does not create a
+Synology-user dependency. Worker credential implementation is a deployment detail;
+credentials and lease tokens never appear in portal output or NAS mirrors.
+
+Worker-facing:
+  POST /workers/register
+    Request: persistent worker_id (or null on first registration), display_name,
+    platform, worker_version, capabilities, accessible_storage_ids, max_tasks=1.
+    Returns: worker_id, worker_version_counter, heartbeat_seconds, lease_seconds,
+    server_time, supported_contract_versions. Existing identity requires proof of
+    its provisioned credential; another machine cannot register over that ID.
+
+  POST /workers/{worker_id}/heartbeat
+    Request: sequence, health/resource summary, optional active attempt + token,
+    stage/progress, acknowledged-event sequence and small local-state snapshot.
+    Returns: server_time, lease_expires_at if renewed, directives such as cancel,
+    pause_new_tasks, or upgrade_required. Older heartbeat sequences do not regress
+    worker state. “Last seen” and “last progress” are tracked independently.
+
+  POST /workers/{worker_id}/claims
+    Request: request_id, available capacity and optional checkpoint cache hints.
+    Returns 200 with a leased task/attempt or 204 when no work is available.
+    Atomic claim: never assign one attempt to two workers. Retrying request_id
+    returns the same still-valid lease. An already-busy worker gets its existing
+    assignment rather than another job. Poll every 10 seconds with jitter initially.
+    No second “sync” queue endpoint in v1; heartbeat + claim have distinct purposes.
+
+  GET /attempts/{attempt_id}
+    Reconcile local state; worker may inspect only its own assigned attempt.
+
+  POST /attempts/{attempt_id}/events
+    Request: lease_token, ordered events with unique increasing sequence numbers.
+    Event: stage_started/stage_progress/stage_completed/checkpoint_available,
+    worker timestamp, monotonic elapsed, compact metadata/blob references.
+    Returns: acknowledged_sequence and attempt version. Persist each unique event
+    once, reject conflicting sequence reuse or gaps; lost responses can be replayed.
+    Throttle progress events to roughly one per 5 seconds; stage boundaries immediate.
+
+  POST /attempts/{attempt_id}/complete
+    Request: lease_token, final_event_sequence, timing summary and result_ref
+    (normal/experiment) or compact dryrun findings. Result manifest includes source
+    digest, input/config/model fingerprints, artifact checksums and stage outcomes.
+    Returns: task status + publication status. Accept only after required events
+    have been acknowledged and the result is validated. Idempotent retry after a
+    successful completion returns the stored result even though its lease ended.
+
+  POST /attempts/{attempt_id}/fail
+    Request: lease_token, last_event_sequence, error_code, retryable flag,
+    sanitized message, timing summary, optional attempt-scoped diagnostic ref.
+    Server applies retry policy; worker does not schedule its own queue retries.
+    Cancellation is reported with a specific cancelled outcome. Repeated identical
+    failure reporting returns the original accepted outcome.
+
+Portal/admin-facing (also usable by scripts):
+  GET  /workers                         live/offline/paused workers and capabilities
+  PATCH /workers/{id}                   pause/resume scheduling; expected_version
+  GET  /sources                        discovered recordings, metadata, active result
+  POST /tasks                          explicit task/rerun; optional parent_task_id
+  GET  /tasks?status=&source_id=&cursor=  paginated persistent history
+  GET  /tasks/{id}                      spec, attempts, stages, timing and result refs
+  POST /tasks/{id}/cancel               cooperative cancel; expected_version
+  POST /tasks/{id}/rerun                NEW task with explicit config/model changes
+  POST /tasks/{id}/activate             select completed process result; expected
+                                       current active run + task version required
+  GET  /attempts/{id}/events?after=     replay/poll progress and event history
+  GET/POST/PATCH /watchers[/{id}]        input root, stability window, executor policy
+  POST /watchers/{id}/scan              request immediate scan, return scan ID
+  GET  /scans/{id}                      discovery progress/errors/counts
+  GET  /metrics/timings?source_id=&pipeline_version=&format=json|csv
+                                       per-attempt/stage data, including failed runs
+  GET  /healthz                        server liveness
+  GET  /readyz                         database/scheduler/storage readiness summary
+
+Errors use {"error":{"code":"stale_lease","message":"...","retryable":false}}.
+Relevant codes: 400 invalid_request, 401/403 identity/access failure, 404 not_found,
+409 stale_lease/version_conflict/idempotency_conflict, 413 metadata_too_large,
+422 incompatible_input/result, 503 storage_unavailable/server_unavailable.
+Do not put private absolute paths in error messages.
+
+7. EXAMPLE CLAIM RESPONSE (ABBREVIATED)
+
+{
+  "contract_version": 1,
+  "task": {
+    "id": "task_01", "type": "process", "source_id": "source_01",
+    "input": {"storage_id":"originals", "path":"session/video.mov",
+              "sha256":"<expected digest, or null until first verification>", "bytes":123456789},
+    "source_signature": {"bytes":123456789, "modified_at":"2026-10-30T10:00:00Z"},
+    "pipeline": {"version":"2.0.0", "build_digest":"<worker build digest>"},
+    "algorithm": {"id":"practice-pose-v1", "model_ref":{"storage_id":"processing", "path":"models/pose.onnx", "sha256":"<digest>"}},
+    "parameters": {"analysis_fps":8}, "parameters_hash":"<digest>",
+    "publication_policy":"if_no_active_result"
+  },
+  "attempt": {
+    "id":"attempt_01", "number":1, "lease_token":"<opaque secret>",
+    "lease_expires_at":"2026-10-30T12:01:30Z",
+    "output_prefix":{"storage_id":"processing", "path":"runs/task_01/attempt_01/"},
+    "resume_candidates":[]
+  }
+}
+
+For dryrun, output_prefix is null and NAS artifact upload stages are skipped.
+Model/dataset refs are read-only. Dryrun still reports its source hash and findings.
+
+8. INPUT SCANNING, PUBLICATION AND TIMING RULES
+
+Scanner observes files unchanged for a configurable window (initially 180 seconds),
+ignores hidden/incomplete/output folders and checks mount identity. Discovery is
+provisional until hashing: size/mtime alone never establish content identity.
+Worker verifies/hash-reports input before analysis; server resolves canonical source
+identity by content digest. A changed input invalidates the attempt. Duplicate
+first-seen files can cause duplicate computation, but not duplicate canonical
+publication. Repeated scans deduplicate task creation transactionally against the
+observed file generation + pipeline/config policy. A new algorithm does not
+silently reprocess all historical footage; choose an explicit rerun batch.
+
+Completion protocol:
+1. Worker writes only its immutable attempt namespace, verifies checksums and
+   writes its result manifest last. Dryrun skips this step.
+2. Server validates schema, source identity, authorized storage prefixes, artifact
+   availability and verification evidence. Full server-side rehashing is optional
+   verification work, not a metadata API operation on every request.
+3. Server durably records completion/result and a publication intent transaction.
+4. Server publisher creates the compatible viewing-library generation and commits
+   the active manifest last. A transactionally serialized activation plus expected
+   active-run checks prevent races. Recover/reconcile publication intents after a
+   crash; database and filesystem updates are NOT assumed to be one transaction.
+5. Server records activation outcome. Preserve the previous generation for rollback.
+
+Keep source identity stable for viewing-site likes/court assignments. Versioned run
+artifacts use unique safe directory names; the existing v1 viewing manifest points
+to ONE active generation. Review URLs still represent the original video. Clip IDs
+remain boundary-derived; changed cuts create new IDs and do not inherit likes by
+position. Do not put multiple algorithm runs into the home library as duplicate
+recordings. Experiments remain outside that library.
+
+Server owns durable per-task/per-attempt timing history, including retries, failed
+stages, queue/backoff, claim delay, transfer, compute, upload and publication.
+Workers send monotonic stage/attempt durations; never subtract clocks on different
+machines to calculate elapsed work. Record UTC timestamps for correlation and
+server receipt timestamps for scheduling. Report total wall time, summed attempt
+work and queue time separately; overlapping work is not summed as elapsed time.
+Interrupted attempts have partial/unknown durations, not invented completion times.
+The existing Mac timing reports can be imported as legacy per-attempt evidence;
+missing historical details remain unknown.
+
+9. CONTROL PORTAL — INITIAL SCOPE
+
+- Dashboard: queued/running/failed tasks; live workers; last heartbeat versus last
+  progress; stage elapsed time; storage/server health and recent completions.
+- Jobs: filter by source, type, algorithm/config, status and date; inspect all
+  attempts, stage breakdowns, errors, result refs and parent/child rerun history.
+- Trigger process/dryrun/experiment from an existing source; preview configuration
+  before enqueue. Experiment requires a supported executor, not a placeholder run.
+- Watchers: configure input storage/root, enable/disable, stability window and scan.
+- Workers: capacity, capabilities, current task, pause/resume new assignments.
+- Cancel cooperatively, retry by policy, create manual reruns and explicitly
+  activate a verified result. Existing active result stays visible during reruns.
+- Timing export and algorithm-version comparisons. No media management, user
+  accounts, automatic retraining or distributed autoscaling in the first release.
+- LAN-only Docker deployment behind the existing NAS reverse proxy; responsive
+  portal. Polling is enough initially; server-sent events can follow later.
+
+10. IMPLEMENTATION SEQUENCE AFTER DESIGN REVIEW
+
+A. Server DB/state machine/API + fake workers; test atomic claims, duplicate requests,
+   expired leases, partitioned workers, cancellation and publication crash recovery.
+B. Extract current processor into a stage executor + Mac API worker. Preserve HDR,
+   decode/checksum validation, original metadata, cut plans and stage timings.
+C. Local checkpoint recovery + server-mirrored state; implement all task-mode
+   side-effect rules and tests before permitting live publication.
+D. Portal, input scanner and manual reruns. Shadow/dryrun on sample footage.
+E. Publish public source/image, deploy separate server-state storage, register Mac,
+   pause old watcher, reconcile/import completed source records, then enable the
+   new scanner. NEVER run both automatic schedulers over the same input set.
+F. Activate one test result, verify viewing compatibility/likes/courts/rollback,
+   then cut over. Keep old runtime/config/outputs for rollback.
+G. Benchmark stage optimization and bounded compute/transfer overlap using timing
+   history. Windows adapter, multi-worker scheduling enhancements and experiment
+   executors follow without changing the basic lease/file-reference contract.
+
+Repository proposal: keep the portable worker/stage executor in tennis-processing;
+create a separate tennis-processing-server repository for the Docker server, API
+contract and control portal. Keep tennis-web as the viewing app and
+tennis-algorithm-lab as future research/evaluation. No new repository is created
+until implementation begins.
+
+IMPLEMENTATION CLARIFICATIONS
+- Main rendering/export stage is named process, per user request.
+- Dryrun creates local media but uploads no media/artifact/checkpoint blobs to NAS.
+- P2 TODO: local-media cleanup task/policy for dryruns, interrupted work and old
+  checkpoints. Must protect active task workspaces and support retention rules.
+- Source metadata snapshots preserve original container/stream tags, codec/color
+  information and codec extra data. Edited clips keep correct edited timing;
+  obsolete original Dolby Vision dynamic metadata must not be applied to them.
+- Upload once: workers write immutable attempt folders; the server uses same-
+  filesystem rename into versioned library directories and replaces only the
+  small active manifest. Different filesystem publication is refused.
