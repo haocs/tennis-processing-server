@@ -168,3 +168,17 @@ def test_viewing_status_bridge_reports_worker_liveness_and_redacts_source_paths(
     assert value['files'][0]['status']=='processing'
     assert str(Path(cfg['storage']['originals']['path'])) not in status.read_text()
     assert a['lease_token'] not in status.read_text()
+
+
+def test_legacy_result_reference_is_immutable_after_active_manifest_changes(env):
+    from legacy import import_library
+    app,c,h,s,cfg=env;store=app.config['STORE'];files=app.config['FILES']
+    root=Path(cfg['storage']['library']['path'])/'metadata/sessions';root.mkdir(parents=True)
+    digest=hashlib.sha256(b'input').hexdigest();path=root/(digest+'.json')
+    original={'id':digest,'source':{'name':'test.mov'},'algorithm':'legacy-v1'};path.write_text(json.dumps(original))
+    import_library(store,files)
+    reference=store.tasks()[0]['result']['result_ref']
+    path.write_text(json.dumps(dict(original,algorithm='new-algorithm',processing={'attempt_id':'new'})))
+    import_library(store,files)
+    assert json.loads(files.resolve(reference).read_text())['algorithm']=='legacy-v1'
+    assert store.tasks()[0]['result']['result_ref']==reference
