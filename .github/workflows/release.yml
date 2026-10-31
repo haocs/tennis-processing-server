@@ -3,6 +3,7 @@ name: Test and release container
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   release:
     types: [published]
@@ -29,7 +30,7 @@ jobs:
         run: bash scripts/container-smoke.sh processing-ci:test
 
   publish:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -43,7 +44,7 @@ jobs:
       - name: Set validated image and release tags
         id: image
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
         shell: bash
         run: |
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then

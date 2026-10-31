@@ -152,3 +152,19 @@ def test_legacy_import_does_not_enqueue_again_on_watcher_scan(env):
     scan(store,files,watcher);clock[0]=1011;scan(store,files,watcher)
     assert len(store.tasks())==1
     assert store.tasks()[0]['result']['timing']['total_seconds'] is None
+
+
+def test_viewing_status_bridge_reports_worker_liveness_and_redacts_source_paths(env):
+    from scheduler import mirror_viewing_status
+    app,c,h,s,cfg=env;store=app.config['STORE'];files=app.config['FILES']
+    mirror_viewing_status(store,files)
+    status=Path(cfg['storage']['library']['path'])/'metadata/Processing-status.json'
+    assert json.loads(status.read_text())['stage']=='Waiting for worker'
+    w,wh=worker(c);identity=task(c,h,s,'process');a=claim(c,w,wh)['attempt']
+    c.post('/api/v1/workers/'+w+'/heartbeat',json={'sequence':1,'stage':'process','last_progress_at':store.clock(),'local_state':{'task_id':identity},'active':{'attempt_id':a['id'],'lease_token':a['lease_token']}},headers=wh)
+    mirror_viewing_status(store,files)
+    value=json.loads(status.read_text())
+    assert value['current_video']=='test.mov'
+    assert value['files'][0]['status']=='processing'
+    assert str(Path(cfg['storage']['originals']['path'])) not in status.read_text()
+    assert a['lease_token'] not in status.read_text()

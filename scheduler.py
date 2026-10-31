@@ -53,6 +53,33 @@ def tick(store,files):
         except (OSError,ValueError,KeyError,Conflict):
             with store.tx() as db: db.execute("UPDATE tasks SET publication='failed' WHERE id=?",(identity,))
 
+    mirror_viewing_status(store,files)
+
+
+def mirror_viewing_status(store,files):
+    """Compatibility bridge: server owns the viewing app's small status file."""
+    tasks=store.tasks();workers=store.workers();active=[t for t in tasks if t['status'] in ('running','leased','cancel_requested')]
+    live=[w for w in workers if w['online']]
+    with store.tx() as db:
+        sources={r['id']:json.loads(r['body']) for r in db.execute('SELECT id,body FROM sources')}
+    current=active[0] if active else None
+    worker=next((w for w in live if w.get('snapshot',{}).get('local_state',{}).get('task_id')==(current or {}).get('id')),None)
+    snapshot=(worker or {}).get('snapshot',{})
+    state_map={'succeeded':'done','failed':'needs_attention','queued':'waiting','retry_wait':'retry','leased':'processing','running':'processing','cancel_requested':'processing','cancelled':'cancelled'}
+    rows=[];seen=set()
+    for task in tasks:
+        if task['type']!='process' or task['source_id'] in seen:continue
+        seen.add(task['source_id']);source=sources[task['source_id']]
+        rows.append({'path':Path(source['path']).name,'status':state_map[task['status']],'error':'Processing failed; inspect control portal' if task['status']=='failed' else None,'output':'Published' if task['publication_status']=='active' else None})
+    stage=snapshot.get('stage','Processing') if current else ('Idle' if live else 'Waiting for worker')
+    value={'heartbeat':store.clock(),'progress_at':snapshot.get('last_progress_at') or store.clock(),'stage':stage,'service':'Running','progress':snapshot.get('progress'),'storage':'ready','timezone':files.config.get('timezone','UTC'),'current_video':Path(sources[current['source_id']]['path']).name if current else None,'files':rows,'scan_error':None,'orchestrator':'processing-server'}
+    for name in ('originals','processing','library'):
+        try:files.root(name)
+        except OSError:value.update(storage='unavailable',scan_error='Storage unavailable')
+    atomic(files.root('library')/'metadata/Processing-status.json',value)
+    text='TENNIS PROCESSING SERVER\n\nService: '+value['service']+'\nStage: '+value['stage']+'\nWorker status and complete task history are available in the control portal.\n'
+    target=files.root('library')/'metadata/Processing-status.txt';temporary=target.with_suffix('.tmp');temporary.write_text(text);os.replace(temporary,target)
+
 
 def routes(app,store,files,body):
     @app.get('/api/v1/watchers')

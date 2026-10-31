@@ -92,3 +92,8 @@ First claim binds an unassigned task to the worker's code/model digests. Subsequ
 attempts require the same build/model; heartbeat updates a worker's runtime
 advertisement after upgrade. Rerun to select a new algorithm/build. Actual runtime
 and effective cut settings remain in result metadata for reproducibility.
+
+The scheduler mirrors a small compatibility status JSON/text into library metadata
+for the existing viewing site's processing indicator. Worker offline/stale state
+is separate from server liveness. Image publication also runs on version-tag pushes,
+so releases can be performed with Git/API tooling without browser operations.
