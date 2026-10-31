@@ -3,7 +3,21 @@ set -euo pipefail
 image="$1"
 fixture=$(mktemp -d)
 container="processing-smoke-$$"
-trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT
+cleanup() {
+  code=$?
+  if [ "$code" -ne 0 ]; then
+    python - "$container" <<'PYCODE'
+import subprocess,sys
+r=subprocess.run(['docker','logs',sys.argv[1]],capture_output=True,text=True)
+message=(r.stdout+r.stderr)[-6000:]
+message=message.replace('%','%25').replace('\r','%0D').replace('\n','%0A')
+print('::error title=Container startup logs::'+message)
+PYCODE
+  fi
+  docker rm -f "$container" >/dev/null 2>&1 || true
+  rm -rf "$fixture"
+}
+trap cleanup EXIT
 mkdir -p "$fixture/data" "$fixture/tennis/.processing" "$fixture/originals"
 cp server.example.json "$fixture/server.json"
 chmod -R a+rwX "$fixture"

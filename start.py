@@ -15,6 +15,8 @@ def stop(*args):
 signal.signal(signal.SIGTERM,lambda *args:(stop(),sys.exit(0)))
 signal.signal(signal.SIGINT,lambda *args:(stop(),sys.exit(0)))
 try:
+    from app import create_app
+    create_app()  # Initialize SQLite/WAL once before concurrent child startup.
     children.append(subprocess.Popen([sys.executable,'scheduler.py']))
     children.append(subprocess.Popen([sys.executable,'-m','gunicorn','--bind','0.0.0.0:8000','--workers','2','--threads','4','--timeout','120','--worker-tmp-dir','/tmp','--access-logfile','-','app:create_app()']))
     while all(child.poll() is None for child in children): time.sleep(1)
