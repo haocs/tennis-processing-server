@@ -15,10 +15,10 @@ print('::error title=Container startup logs::'+message)
 PYCODE
   fi
   docker rm -f "$container" >/dev/null 2>&1 || true
-  rm -rf "$fixture"
+  rm -rf "$fixture" || sudo rm -rf -- "$fixture"
 }
 trap cleanup EXIT
-mkdir -p "$fixture/data" "$fixture/tennis/.processing" "$fixture/originals"
+mkdir -p "$fixture/data" "$fixture/tennis/.processing" "$fixture/tennis/metadata" "$fixture/originals"
 cp server.example.json "$fixture/server.json"
 chmod -R a+rwX "$fixture"
 docker run -d --name "$container" --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true -p 127.0.0.1::8000 -v "$fixture/server.json:/config/server.json:ro" -v "$fixture/data:/data" -v "$fixture/originals:/originals:ro" -v "$fixture/tennis:/tennis" "$image"
