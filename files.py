@@ -40,6 +40,20 @@ def inside(root, path):
     return dest
 
 
+def read_bounded_bytes(path, max_bytes, too_large_code, error_cls=ValueError):
+    p=Path(path)
+    if p.is_symlink() or not p.is_file():
+        raise error_cls('invalid_storage_path')
+    st=p.stat()
+    if st.st_size>max_bytes:
+        raise error_cls(too_large_code)
+    with p.open('rb') as stream:
+        raw=stream.read(max_bytes+1)
+    if len(raw)>max_bytes:
+        raise error_cls(too_large_code)
+    return raw
+
+
 def atomic(path, value):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     temp=path.with_name('.'+path.name+'.'+uuid.uuid4().hex)
@@ -71,8 +85,8 @@ class Files:
         expected=f"runs/{body['task_id']}/{attempt}/result.json"
         if ref['storage_id']!='processing' or ref['path']!=expected: raise ValueError('result_outside_attempt')
         path=self.resolve(ref)
-        if path.stat().st_size>8*1024*1024: raise ValueError('result_manifest_too_large')
-        data=json.loads(path.read_text())
+        raw_result=read_bounded_bytes(path,8*1024*1024,'result_manifest_too_large')
+        data=json.loads(raw_result.decode())
         if data['attempt_id']!=attempt or data['task_id']!=body['task_id'] or not re.fullmatch('[a-f0-9]{64}',data['source_sha256']): raise ValueError('invalid_result_identity')
         if not data.get('files'): raise ValueError('empty_result')
         file_map={}
@@ -106,9 +120,7 @@ class Files:
                 raise ValueError('missing_result_artifact')
             h_item=file_map['metadata/heuristic-diagnostics.json']
             h_path=inside(path.parent,'metadata/heuristic-diagnostics.json')
-            raw_bytes=h_path.read_bytes()
-            if len(raw_bytes)>MAX_HEURISTICS_BYTES:
-                raise ValueError('heuristic_diagnostics_too_large')
+            raw_bytes=read_bounded_bytes(h_path,MAX_HEURISTICS_BYTES,'heuristic_diagnostics_too_large')
             if hashlib.sha256(raw_bytes).hexdigest()!=h_item['sha256']:
                 raise ValueError('invalid_artifact')
             try:
@@ -123,6 +135,7 @@ class Files:
                 task_id=body['task_id'],
                 published_at=public.get('published_at'),
                 duration_seconds=public.get('source',{}).get('duration_seconds'),
+                session=public,
             )
         return data
 
@@ -178,9 +191,13 @@ class Files:
         candidate_manifest=lib/'metadata/candidates'/digest/f'{attempt}.json'
         atomic(candidate_manifest,public)
         with store.tx() as db:
+            now=store.clock()
             is_active=bool(db.execute('SELECT 1 FROM publications WHERE source_hash=? AND attempt_id=?',(digest,attempt)).fetchone())
             target_state='available' if is_active else 'staged_candidate'
-            db.execute('UPDATE attempts SET media_state=?,gc_eligible_since=NULL WHERE id=?',(target_state,attempt))
+            cur_att=db.execute('SELECT body FROM attempts WHERE id=?',(attempt,)).fetchone()
+            cur_body=json.loads(cur_att['body']) if (cur_att and cur_att['body']) else {}
+            cur_body.setdefault('staged_at',now)
+            db.execute('UPDATE attempts SET media_state=?,gc_eligible_since=NULL,body=? WHERE id=?',(target_state,encode(cur_body),attempt))
             db.execute("UPDATE staging_intents SET status='completed' WHERE task_id=?",(task_id,))
             store._recompute_attempt_media_state(db,attempt)
             updated=db.execute('SELECT media_state FROM attempts WHERE id=?',(attempt,)).fetchone()
@@ -277,6 +294,9 @@ class Files:
                     db.execute("DELETE FROM artifact_pins WHERE target_type='attempt' AND target_id=? AND holder_kind='serving_active'",(prev_attempt,))
                     prev_row=db.execute('SELECT * FROM attempts WHERE id=?',(prev_attempt,)).fetchone()
                     if prev_row and prev_row['worker_id']!='legacy-import' and prev_row['media_state'] in ('available','staged_candidate','gc_eligible'):
+                        prev_body=json.loads(prev_row['body']) if prev_row['body'] else {}
+                        prev_body['superseded_at']=now
+                        db.execute('UPDATE attempts SET body=? WHERE id=?',(encode(prev_body),prev_attempt))
                         rollback_ttl=(self.config.get('retention') or {}).get('rollback_ttl_seconds')
                         rollback_expires=(now+float(rollback_ttl)) if rollback_ttl is not None else None
                         db.execute('INSERT OR REPLACE INTO artifact_pins VALUES(?,?,?,?,?,?,?,?)',('attempt',prev_attempt,digest,'rollback_previous','serving_rollback',now,rollback_expires,encode({'superseded_by':attempt})))
@@ -421,7 +441,20 @@ class Files:
             if not has_heuristics or not heur_ref:
                 raise KeyError('heuristics_not_found')
             path=self.resolve(heur_ref)
-            return json.loads(path.read_text())
+            raw=read_bounded_bytes(path,MAX_HEURISTICS_BYTES,'heuristic_diagnostics_too_large')
+            data=json.loads(raw.decode())
+            res=json.loads(att_row['result']) if att_row['result'] else {}
+            validate_heuristics(
+                data,
+                len(raw),
+                res.get('source_sha256') or manifest.get('id'),
+                attempt_id,
+                task_id=task_row['id'] if task_row else None,
+                published_at=manifest.get('published_at'),
+                duration_seconds=manifest.get('source',{}).get('duration_seconds'),
+                session=manifest,
+            )
+            return data
 
     def create_feedback_snapshot(self, store, payload, idempotency_key=None):
         if not isinstance(payload,dict):
@@ -469,7 +502,8 @@ class Files:
 
             def _persist():
                 if snap_path.exists():
-                    if snap_path.read_bytes()!=raw_bytes:
+                    existing_bytes=read_bounded_bytes(snap_path,MAX_ARTIFACT_BYTES,'feedback_snapshot_too_large',InvalidFeedback)
+                    if existing_bytes!=raw_bytes:
                         raise Conflict('snapshot_hash_collision')
                 else:
                     snap_path.parent.mkdir(parents=True,exist_ok=True)
@@ -591,11 +625,9 @@ class Files:
                 if not isinstance(constraints_ref,dict) or constraints_ref.get('storage_id')!='processing' or not isinstance(constraints_ref.get('path'),str):
                     raise ValueError('invalid_cut_constraints_ref')
                 c_path=self.resolve(constraints_ref)
-                if not c_path.is_file():
+                if not c_path.is_file() or c_path.is_symlink():
                     raise ValueError('cut_constraints_not_found')
-                c_bytes=c_path.read_bytes()
-                if len(c_bytes)>MAX_ARTIFACT_BYTES:
-                    raise ValueError('cut_constraints_too_large')
+                c_bytes=read_bounded_bytes(c_path,MAX_ARTIFACT_BYTES,'cut_constraints_too_large')
                 c_sha=hashlib.sha256(c_bytes).hexdigest()
                 if constraints_ref.get('sha256') and constraints_ref['sha256']!=c_sha:
                     raise ValueError('cut_constraints_hash_mismatch')
@@ -652,6 +684,89 @@ class Files:
                 spec['feedback_snapshot_id']=snap_row['id']
             return spec
 
+    def _has_any_symlink(self, root_dir):
+        if os.path.islink(root_dir):
+            return True
+        if not os.path.isdir(root_dir):
+            return False
+        for cur_root, dirs, files in os.walk(root_dir, followlinks=False):
+            for name in (*dirs, *files):
+                if os.path.islink(os.path.join(cur_root, name)):
+                    return True
+        return False
+
+    def _lexical_eviction_paths(self, attempt_id):
+        if not isinstance(attempt_id,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',attempt_id):
+            return None
+        lib=self.root('library')
+        media_root=lib/'media'
+        trash_root=media_root/'.trash'
+        runs_meta_root=lib/'metadata'/'runs'
+        for p in (lib,media_root,lib/'metadata',runs_meta_root):
+            if os.path.islink(p):
+                return None
+        trash_root.mkdir(parents=True,exist_ok=True)
+        if os.path.islink(trash_root):
+            return None
+        orig=media_root/attempt_id
+        trash=trash_root/attempt_id
+        meta_dir=runs_meta_root/attempt_id
+        session_file=meta_dir/'session.json'
+        if any(os.path.islink(p) for p in (orig,trash,meta_dir,session_file)):
+            return None
+        if self._has_any_symlink(orig) or self._has_any_symlink(trash):
+            return None
+        return orig,trash,session_file
+
+    def _verify_attempt_eviction_identity(self, db, att_row, session_file):
+        att_id=att_row['id']
+        if att_row['worker_id']=='legacy-import' or att_row['status']!='succeeded':
+            return False
+        if db.execute('SELECT 1 FROM publications WHERE attempt_id=?',(att_id,)).fetchone():
+            return False
+        task_row=db.execute('SELECT * FROM tasks WHERE id=?',(att_row['task_id'],)).fetchone()
+        if not task_row:
+            return False
+        src_row=db.execute('SELECT * FROM sources WHERE id=?',(task_row['source_id'],)).fetchone()
+        if not src_row:
+            return False
+        src_body=json.loads(src_row['body']) if src_row['body'] else {}
+        att_res=json.loads(att_row['result']) if att_row['result'] else {}
+        digest=att_res.get('source_sha256')
+        if not isinstance(digest,str) or not re.fullmatch('[a-f0-9]{64}',digest):
+            return False
+        if src_body.get('sha256')!=digest:
+            return False
+        try:
+            raw_sess=read_bounded_bytes(session_file,MAX_ARTIFACT_BYTES,'session_manifest_too_large')
+            sess=json.loads(raw_sess.decode())
+        except (OSError,ValueError,UnicodeDecodeError,json.JSONDecodeError):
+            return False
+        if not isinstance(sess,dict):
+            return False
+        proc=sess.get('processing') if isinstance(sess.get('processing'),dict) else {}
+        if (
+            sess.get('id')!=digest
+            or (sess.get('source') or {}).get('sha256')!=digest
+            or sess.get('media_directory')!=att_id
+            or sess.get('artifact_directory')!=att_id
+            or proc.get('attempt_id')!=att_id
+            or proc.get('task_id')!=task_row['id']
+        ):
+            return False
+        ref=att_res.get('result_ref')
+        if not isinstance(ref,dict):
+            return False
+        try:
+            rpath=self.resolve(ref)
+            raw_res=read_bounded_bytes(rpath,8*1024*1024,'result_manifest_too_large')
+            rdata=json.loads(raw_res.decode())
+        except (OSError,ValueError,UnicodeDecodeError,json.JSONDecodeError):
+            return False
+        if rdata.get('attempt_id')!=att_id or rdata.get('task_id')!=task_row['id'] or rdata.get('source_sha256')!=digest:
+            return False
+        return True
+
     def recover_quarantined(self, store):
         import fcntl
         with open(store.path+'.publisher.lock','a') as lock:
@@ -659,30 +774,24 @@ class Files:
             return self._recover_quarantined(store)
 
     def _recover_quarantined(self, store):
-        lib=self.root('library')
-        media_root=lib/'media'
-        trash_root=media_root/'.trash'
         recovered=[];conflicts=[]
         with store.tx() as db:
             rows=db.execute("SELECT * FROM attempts WHERE media_state='quarantined'").fetchall()
-            active_attempts={r['attempt_id'] for r in db.execute('SELECT attempt_id FROM publications').fetchall()}
-        for row in rows:
+            valid_rows=[]
+            for row in rows:
+                att_id=row['id']
+                paths=self._lexical_eviction_paths(att_id)
+                if not paths or not self._verify_attempt_eviction_identity(db,row,paths[2]):
+                    conflicts.append(att_id)
+                    continue
+                valid_rows.append((row,paths))
+        for row,(orig,trash,_) in valid_rows:
             att_id=row['id']
-            if att_id in active_attempts:
+            if os.path.islink(orig) or os.path.islink(trash) or self._has_any_symlink(orig) or self._has_any_symlink(trash):
                 conflicts.append(att_id)
                 continue
-            try:
-                orig=inside(media_root,att_id)
-                trash_root.mkdir(parents=True,exist_ok=True)
-                trash=inside(trash_root,att_id)
-            except ValueError:
-                conflicts.append(att_id)
-                continue
-            orig_exists=orig.exists() or orig.is_symlink()
-            trash_exists=trash.exists() or trash.is_symlink()
-            if (orig_exists and orig.is_symlink()) or (trash_exists and trash.is_symlink()):
-                conflicts.append(att_id)
-                continue
+            orig_exists=os.path.lexists(orig)
+            trash_exists=os.path.lexists(trash)
             if orig_exists and trash_exists:
                 # Ambiguous state: both original and trash exist; keep fenced in 'quarantined', never delete or mark evicted!
                 conflicts.append(att_id)
@@ -692,7 +801,7 @@ class Files:
                 shutil.rmtree(trash)
             elif trash_exists and not orig_exists:
                 shutil.rmtree(trash)
-            if orig.exists() or trash.exists():
+            if os.path.lexists(orig) or os.path.lexists(trash):
                 conflicts.append(att_id)
                 continue
             with store.tx() as db:
@@ -716,13 +825,15 @@ class Files:
                     store._recompute_attempt_media_state(db,c['id'],retention_enabled=True)
                 now=store.clock()
                 eligible=db.execute("SELECT * FROM attempts WHERE media_state='gc_eligible' AND gc_eligible_since IS NOT NULL AND ?-gc_eligible_since>=?",(now,grace)).fetchall()
-            lib=self.root('library')
-            media_root=lib/'media'
-            trash_root=media_root/'.trash'
-            trash_root.mkdir(parents=True,exist_ok=True)
             evicted=[]
             for row in eligible:
                 att_id=row['id']
+                paths=self._lexical_eviction_paths(att_id)
+                if not paths:
+                    recovery['conflicts'].append(att_id)
+                    continue
+                orig,trash,session_file=paths
+                quarantined_ok=False
                 with store.tx() as db:
                     store.expire_pins(db,retention_enabled=True)
                     now=store.clock()
@@ -731,16 +842,26 @@ class Files:
                     cur=db.execute('SELECT * FROM attempts WHERE id=?',(att_id,)).fetchone()
                     if pin_count>0 or is_active or not cur or cur['media_state']!='gc_eligible':
                         continue
+                    if not self._verify_attempt_eviction_identity(db,cur,session_file):
+                        recovery['conflicts'].append(att_id)
+                        continue
+                    if os.path.lexists(orig) and os.path.lexists(trash):
+                        recovery['conflicts'].append(att_id)
+                        continue
                     db.execute("UPDATE attempts SET media_state='quarantined' WHERE id=?",(att_id,))
-                orig=inside(media_root,att_id)
-                trash=inside(trash_root,att_id)
-                if orig.exists() and trash.exists():
+                    quarantined_ok=True
+                if not quarantined_ok:
+                    continue
+                if os.path.islink(orig) or os.path.islink(trash) or (os.path.lexists(orig) and os.path.lexists(trash)):
                     recovery['conflicts'].append(att_id)
                     continue
-                if orig.exists():
+                if os.path.lexists(orig):
                     os.rename(orig,trash)
-                if trash.exists():
+                if os.path.lexists(trash):
                     shutil.rmtree(trash)
+                if os.path.lexists(orig) or os.path.lexists(trash):
+                    recovery['conflicts'].append(att_id)
+                    continue
                 with store.tx() as db:
                     db.execute("UPDATE attempts SET media_state='evicted',media_evicted_at=? WHERE id=?",(store.clock(),att_id))
                 evicted.append(att_id)

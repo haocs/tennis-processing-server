@@ -421,7 +421,7 @@ def test_stage_candidate_activation_crash_replay_and_catalog_identities(env,monk
         'video_version_id':version_id(digest,pub2),
         'truth_status':'heuristic_only_not_play_or_swing_truth',
         'source_duration_ms':10000,
-        'clips':[{'clip_id':'c1','original_start_ms':1000,'original_end_ms':4000}],
+        'clips':[{'clip_id':'clip_1','original_start_ms':1000,'original_end_ms':4000}],
         'removed_gaps':[{'gap_index':1,'original_start_ms':4000,'original_end_ms':10000}],
     }
     _write_process_attempt_bundle(cfg,t2,a2['id'],digest,published_at=pub2,heuristics=heur)
@@ -534,6 +534,15 @@ def test_worker_heuristics_size_and_contract_validation(env):
     _write_process_attempt_bundle(cfg,t2,a2['id'],digest,heuristics=bad_heur)
     r2=c.post('/api/v1/attempts/'+a2['id']+'/complete',json={'task_id':t2,'lease_token':a2['lease_token'],'final_event_sequence':0,'source_sha256':digest,'result_ref':{'storage_id':'processing','path':f'runs/{t2}/{a2["id"]}/result.json'}},headers=dict(wh,**{'Idempotency-Key':'h-truth'}))
     assert r2.status_code==400 and r2.json['error']['code']=='forbidden_heuristic_truth_claim'
+    c.post('/api/v1/attempts/'+a2['id']+'/fail',json={'task_id':t2,'lease_token':a2['lease_token'],'final_event_sequence':0,'error_code':'abort','retryable':False},headers=dict(wh,**{'Idempotency-Key':'f-truth'}))
+
+    # 3. Mismatched clip_id or clip bounds against frozen session.clips rejected
+    t3=task(c,h,s,'process','heur-mismatch')
+    a3=claim(c,w,wh)['attempt']
+    mismatch_heur={'schema_version':1,'source_sha256':digest,'attempt_id':a3['id'],'truth_status':'heuristic_only_not_play_or_swing_truth','source_duration_ms':10000,'clips':[{'clip_id':'wrong_id','original_start_ms':1000,'original_end_ms':4000}],'removed_gaps':[]}
+    _write_process_attempt_bundle(cfg,t3,a3['id'],digest,heuristics=mismatch_heur)
+    r3=c.post('/api/v1/attempts/'+a3['id']+'/complete',json={'task_id':t3,'lease_token':a3['lease_token'],'final_event_sequence':0,'source_sha256':digest,'result_ref':{'storage_id':'processing','path':f'runs/{t3}/{a3["id"]}/result.json'}},headers=dict(wh,**{'Idempotency-Key':'h-mismatch'}))
+    assert r3.status_code==400 and r3.json['error']['code']=='heuristic_clip_id_mismatch'
 
 
 def test_pin_isolation_opaque_holders_and_fenced_quarantine_recovery(env):
@@ -571,18 +580,23 @@ def test_pin_isolation_opaque_holders_and_fenced_quarantine_recovery(env):
     sweep_off=c.post('/api/v1/retention/sweep',json={},headers=h).json
     assert sweep_off['enabled'] is False and sweep_off['evicted']==[]
 
-    # Enable retention with 60s grace period; unpinned candidate becomes gc_eligible, re-pinning restores staged_candidate
+    # Enable retention (default 14-day candidate TTL + 60s grace period):
+    # Before 14-day TTL elapses, unpinned candidate stays staged_candidate (not immediately gc_eligible!)
     cfg['retention']={'enabled':True,'grace_period_seconds':60}
     store.retention=cfg['retention']
-    c.get('/api/v1/attempts/'+a['id']+'/pins')
+    assert c.get('/api/v1/attempts/'+a['id']+'/pins').json['media_state']=='staged_candidate'
+    assert c.post('/api/v1/retention/sweep',json={},headers=h).json['evicted']==[]
+
+    # Advance clock past 14-day candidate TTL -> becomes gc_eligible; re-pinning restores staged_candidate
+    clock[0]=2000.0+14*86400+1
     assert c.get('/api/v1/attempts/'+a['id']+'/pins').json['media_state']=='gc_eligible'
     repin=c.post('/api/v1/attempts/'+a['id']+'/pins',json={'holder_kind':'operator_manual','holder_id':'op1'},headers=h).json
     assert repin['media_state']=='staged_candidate'
     c.delete('/api/v1/attempts/'+a['id']+'/pins/operator_manual/op1',headers={'X-Tennis-Request':'1'})
     assert c.get('/api/v1/attempts/'+a['id']+'/pins').json['media_state']=='gc_eligible'
 
-    # Advance past grace period and run retention sweep -> evicted
-    clock[0]=2100.0
+    # Advance past 60s grace period and run retention sweep -> evicted
+    clock[0]+=100.0
     sweep_on=c.post('/api/v1/retention/sweep',json={},headers=h).json
     assert a['id'] in sweep_on['evicted']
     lib=Path(cfg['storage']['library']['path'])
@@ -594,7 +608,7 @@ def test_pin_isolation_opaque_holders_and_fenced_quarantine_recovery(env):
     assert c.post('/api/v1/tasks/'+t+'/activate',json={'expected_active_attempt':None},headers=h).status_code==409
     assert c.post('/api/v1/feedback-snapshots',json=_valid_snapshot_payload(digest,a['id']),headers=dict(h,**{'Idempotency-Key':'snap-evicted'})).status_code==409
 
-    # Test crash recovery for 'quarantined' attempts:
+    # Test crash recovery and pre-quarantine safety for 'quarantined' / symlink / wrong metadata attempts:
     # Case A: Both original and .trash exist -> conflict! Must NOT delete either or mark evicted!
     t_conf=task(c,h,s,'process','cand-conflict')
     a_conf=claim(c,w,wh)['attempt']
@@ -619,6 +633,41 @@ def test_pin_isolation_opaque_holders_and_fenced_quarantine_recovery(env):
     assert a_conf['id'] in rec2['recovered']
     assert not (lib/'media'/a_conf['id']).exists()
     assert c.get('/api/v1/tasks/'+t_conf).json['media_state']=='evicted'
+
+    # Case B: Internal symlink pointing to another attempt inside library/media + wrong/missing metadata
+    t_victim=task(c,h,s,'process','cand-victim')
+    a_victim=claim(c,w,wh)['attempt']
+    _write_process_attempt_bundle(cfg,t_victim,a_victim['id'],digest)
+    c.post('/api/v1/attempts/'+a_victim['id']+'/complete',json={'task_id':t_victim,'lease_token':a_victim['lease_token'],'final_event_sequence':0,'source_sha256':digest,'result_ref':{'storage_id':'processing','path':f'runs/{t_victim}/{a_victim["id"]}/result.json'}},headers=dict(wh,**{'Idempotency-Key':'c-victim'}))
+    c.post('/api/v1/tasks/'+t_victim+'/stage-candidate',json={},headers=h)
+    c.post('/api/v1/attempts/'+a_victim['id']+'/pins',json={'holder_kind':'operator_manual','holder_id':'keep-victim'},headers=h)
+
+    t_sym=task(c,h,s,'process','cand-sym')
+    a_sym=claim(c,w,wh)['attempt']
+    _write_process_attempt_bundle(cfg,t_sym,a_sym['id'],digest)
+    c.post('/api/v1/attempts/'+a_sym['id']+'/complete',json={'task_id':t_sym,'lease_token':a_sym['lease_token'],'final_event_sequence':0,'source_sha256':digest,'result_ref':{'storage_id':'processing','path':f'runs/{t_sym}/{a_sym["id"]}/result.json'}},headers=dict(wh,**{'Idempotency-Key':'c-sym'}))
+    c.post('/api/v1/tasks/'+t_sym+'/stage-candidate',json={},headers=h)
+    # Replace library/media/<a_sym> with an internal symlink pointing to library/media/<a_victim>!
+    shutil.rmtree(lib/'media'/a_sym['id'])
+    (lib/'media'/a_sym['id']).symlink_to(lib/'media'/a_victim['id'])
+    clock[0]+=14*86400+100.0
+    sweep_sym=c.post('/api/v1/retention/sweep',json={},headers=h).json
+    assert a_sym['id'] in sweep_sym['conflicts']
+    assert a_sym['id'] not in sweep_sym['evicted']
+    assert (lib/'media'/a_victim['id']/'Practice.mp4').exists()
+    assert c.get('/api/v1/tasks/'+t_sym).json['media_state']!='evicted'
+
+    # Case C: Tampered/mismatched metadata/runs/<attempt>/session.json blocks quarantine and recovery
+    (lib/'media'/a_sym['id']).unlink()
+    (lib/'media'/a_sym['id']).mkdir(parents=True)
+    (lib/'media'/a_sym['id']/'Practice.mp4').write_bytes(b'sym-own-media')
+    bad_sess=json.loads((lib/'metadata/runs'/a_sym['id']/'session.json').read_text())
+    bad_sess['processing']['attempt_id']='wrong_attempt_id'
+    (lib/'metadata/runs'/a_sym['id']/'session.json').write_text(json.dumps(bad_sess))
+    sweep_bad_meta=c.post('/api/v1/retention/sweep',json={},headers=h).json
+    assert a_sym['id'] in sweep_bad_meta['conflicts']
+    assert (lib/'media'/a_sym['id']/'Practice.mp4').exists()
+    assert c.get('/api/v1/tasks/'+t_sym).json['media_state']!='evicted'
 
 
 def test_legacy_attempts_migrate_unknown_not_available(env):

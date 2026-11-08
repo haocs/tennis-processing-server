@@ -159,22 +159,34 @@ def _contains_forbidden_truth(obj):
     return False
 
 
-def validate_heuristics(data,raw_size,source_sha256,attempt_id,task_id=None,published_at=None,duration_seconds=None):
+def validate_heuristics(data,raw_size,source_sha256,attempt_id,task_id=None,published_at=None,duration_seconds=None,session=None):
     """Independently verify worker heuristic-diagnostics.json <= 512 KiB and contract invariants."""
     if raw_size>MAX_HEURISTICS_BYTES:
         raise ValueError('heuristic_diagnostics_too_large')
     if not isinstance(data,dict) or data.get('schema_version')!=1:
         raise ValueError('invalid_heuristic_diagnostics')
     try:
-        canonical(data)
+        raw_canonical=canonical(data)
     except (ValueError,TypeError):
         raise ValueError('invalid_heuristic_diagnostics')
+    if len(raw_canonical)>MAX_HEURISTICS_BYTES:
+        raise ValueError('heuristic_diagnostics_too_large')
     if data.get('truth_status')!='heuristic_only_not_play_or_swing_truth':
         raise ValueError('invalid_heuristic_truth_status')
     if _contains_forbidden_truth(data):
         raise ValueError('forbidden_heuristic_truth_claim')
     if data.get('source_sha256')!=source_sha256:
         raise ValueError('heuristic_source_mismatch')
+    cache_key=data.get('extraction_cache_key')
+    provenance=data.get('provenance')
+    if cache_key is not None:
+        if not isinstance(cache_key,str) or not re.fullmatch('[a-f0-9]{64}',cache_key):
+            raise ValueError('invalid_heuristic_provenance')
+    if provenance is not None:
+        if not isinstance(provenance,dict) or provenance.get('source_sha256') not in (None,source_sha256):
+            raise ValueError('invalid_heuristic_provenance')
+        if cache_key is not None and provenance.get('extraction_cache_key') not in (None,cache_key):
+            raise ValueError('invalid_heuristic_provenance')
     pub_obj=data.get('publication') if isinstance(data.get('publication'),dict) else {}
     att=data.get('attempt_id') if data.get('attempt_id') is not None else pub_obj.get('attempt_id')
     if att is not None and att!=attempt_id:
@@ -194,22 +206,73 @@ def validate_heuristics(data,raw_size,source_sha256,attempt_id,task_id=None,publ
     if not isinstance(clips_list,list) or not isinstance(gaps_list,list):
         raise ValueError('invalid_heuristic_intervals')
     dur_ms=data.get('source_duration_ms')
-    if dur_ms is not None and (type(dur_ms) is not int or dur_ms<=0):
-        raise ValueError('invalid_heuristic_intervals')
-    for items in (clips_list,gaps_list):
-        for item in items:
-            if not isinstance(item,dict):
+    if dur_ms is not None:
+        if type(dur_ms) is not int or dur_ms<=0:
+            raise ValueError('invalid_heuristic_intervals')
+        if duration_seconds is not None and type(duration_seconds) in (int,float) and abs(dur_ms-round(float(duration_seconds)*1000))>5:
+            raise ValueError('invalid_heuristic_intervals')
+    parsed_clip_intervals=[]
+    for item in clips_list:
+        if not isinstance(item,dict):
+            raise ValueError('invalid_heuristic_intervals')
+        if 'original_start_ms' in item or 'original_end_ms' in item:
+            s_ms,e_ms=item.get('original_start_ms'),item.get('original_end_ms')
+            if type(s_ms) is not int or type(e_ms) is not int or s_ms<0 or e_ms<=s_ms:
                 raise ValueError('invalid_heuristic_intervals')
-            if 'original_start_ms' in item or 'original_end_ms' in item:
-                s_ms,e_ms=item.get('original_start_ms'),item.get('original_end_ms')
-                if type(s_ms) is not int or type(e_ms) is not int or s_ms<0 or e_ms<=s_ms:
+            if dur_ms is not None and e_ms>dur_ms:
+                raise ValueError('invalid_heuristic_intervals')
+        else:
+            s,e=item.get('original_start_seconds'),item.get('original_end_seconds')
+            if any(type(v) not in (int,float) or not math.isfinite(v) for v in (s,e)) or s<0 or e<=s:
+                raise ValueError('invalid_heuristic_intervals')
+            if duration_seconds is not None and type(duration_seconds) in (int,float) and e>duration_seconds+1e-3:
+                raise ValueError('invalid_heuristic_intervals')
+            s_ms,e_ms=round(float(s)*1000),round(float(e)*1000)
+        for hint in (item.get('hints') or []):
+            if not isinstance(hint,dict):
+                raise ValueError('invalid_heuristic_intervals')
+            if 'start_ms' in hint or 'end_ms' in hint:
+                hs,he=hint.get('start_ms'),hint.get('end_ms')
+                if type(hs) is not int or type(he) is not int or hs<s_ms or he>e_ms or he<=hs:
                     raise ValueError('invalid_heuristic_intervals')
-                if dur_ms is not None and e_ms>dur_ms:
+        parsed_clip_intervals.append((s_ms,e_ms,item))
+    for item in gaps_list:
+        if not isinstance(item,dict):
+            raise ValueError('invalid_heuristic_intervals')
+        if 'original_start_ms' in item or 'original_end_ms' in item:
+            s_ms,e_ms=item.get('original_start_ms'),item.get('original_end_ms')
+            if type(s_ms) is not int or type(e_ms) is not int or s_ms<0 or e_ms<=s_ms:
+                raise ValueError('invalid_heuristic_intervals')
+            if dur_ms is not None and e_ms>dur_ms:
+                raise ValueError('invalid_heuristic_intervals')
+        else:
+            s,e=item.get('original_start_seconds'),item.get('original_end_seconds')
+            if any(type(v) not in (int,float) or not math.isfinite(v) for v in (s,e)) or s<0 or e<=s:
+                raise ValueError('invalid_heuristic_intervals')
+            if duration_seconds is not None and type(duration_seconds) in (int,float) and e>duration_seconds+1e-3:
+                raise ValueError('invalid_heuristic_intervals')
+            s_ms,e_ms=round(float(s)*1000),round(float(e)*1000)
+        if any(overlaps((s_ms,e_ms),(cs,ce)) for cs,ce,_ in parsed_clip_intervals):
+            raise ValueError('invalid_heuristic_intervals')
+        for hint in (item.get('hints') or []):
+            if not isinstance(hint,dict):
+                raise ValueError('invalid_heuristic_intervals')
+            if 'start_ms' in hint or 'end_ms' in hint:
+                hs,he=hint.get('start_ms'),hint.get('end_ms')
+                if type(hs) is not int or type(he) is not int or hs<s_ms or he>e_ms or he<=hs:
                     raise ValueError('invalid_heuristic_intervals')
-            else:
-                s,e=item.get('original_start_seconds'),item.get('original_end_seconds')
-                if any(type(v) not in (int,float) or not math.isfinite(v) for v in (s,e)) or s<0 or e<=s:
-                    raise ValueError('invalid_heuristic_intervals')
-                if duration_seconds is not None and type(duration_seconds) in (int,float) and e>duration_seconds+1e-3:
-                    raise ValueError('invalid_heuristic_intervals')
+    if isinstance(session,dict) and isinstance(session.get('clips'),list):
+        sess_clips=session['clips']
+        if len(sess_clips)!=len(parsed_clip_intervals):
+            raise ValueError('heuristic_clip_count_mismatch')
+        for (s_ms,e_ms,d_clip),s_clip in zip(parsed_clip_intervals,sess_clips):
+            if not isinstance(s_clip,dict):
+                continue
+            if s_clip.get('id') and d_clip.get('clip_id') and d_clip['clip_id']!=s_clip['id']:
+                raise ValueError('heuristic_clip_id_mismatch')
+            if 'original_start_seconds' in s_clip and 'original_end_seconds' in s_clip:
+                exp_s=round(float(s_clip['original_start_seconds'])*1000)
+                exp_e=round(float(s_clip['original_end_seconds'])*1000)
+                if abs(s_ms-exp_s)>2 or abs(e_ms-exp_e)>2:
+                    raise ValueError('heuristic_clip_bounds_mismatch')
     return data

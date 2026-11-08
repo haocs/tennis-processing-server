@@ -193,8 +193,14 @@ class Store:
     def release_task_pins(self, db, task_id):
         rows=db.execute("SELECT target_id FROM artifact_pins WHERE target_type='attempt' AND holder_kind='rerun_task' AND holder_id=?",(task_id,)).fetchall()
         if rows:
+            now=self.clock()
             db.execute("DELETE FROM artifact_pins WHERE target_type='attempt' AND holder_kind='rerun_task' AND holder_id=?",(task_id,))
             for r in rows:
+                att=db.execute('SELECT body FROM attempts WHERE id=?',(r['target_id'],)).fetchone()
+                if att:
+                    b=json.loads(att['body']) if att['body'] else {}
+                    b['unpinned_at']=now
+                    db.execute('UPDATE attempts SET body=? WHERE id=?',(encode(b),r['target_id']))
                 self._recompute_attempt_media_state(db,r['target_id'])
 
     def expire_pins(self, db, retention_enabled=None):
@@ -203,6 +209,11 @@ class Store:
         if expired:
             db.execute("DELETE FROM artifact_pins WHERE target_type='attempt' AND expires IS NOT NULL AND expires<=?",(now,))
             for r in expired:
+                att=db.execute('SELECT body FROM attempts WHERE id=?',(r['target_id'],)).fetchone()
+                if att:
+                    b=json.loads(att['body']) if att['body'] else {}
+                    b['unpinned_at']=now
+                    db.execute('UPDATE attempts SET body=? WHERE id=?',(encode(b),r['target_id']))
                 self._recompute_attempt_media_state(db,r['target_id'],retention_enabled=retention_enabled)
 
     def pin_summary(self, db, attempt_id, gc_eligible_since=None):
@@ -224,8 +235,9 @@ class Store:
         }
 
     def _recompute_attempt_media_state(self, db, attempt_id, retention_enabled=None):
+        retention_cfg=self.retention or {}
         if retention_enabled is None:
-            retention_enabled=self.retention_enabled
+            retention_enabled=bool(retention_cfg.get('enabled',False))
         row=db.execute('SELECT * FROM attempts WHERE id=?',(attempt_id,)).fetchone()
         if not row:
             return None
@@ -238,20 +250,48 @@ class Store:
             return 'available'
         now=self.clock()
         pin_count=db.execute("SELECT COUNT(*) FROM artifact_pins WHERE target_type='attempt' AND target_id=? AND (expires IS NULL OR expires>?)",(attempt_id,now)).fetchone()[0]
-        task_row=db.execute('SELECT publication FROM tasks WHERE id=?',(row['task_id'],)).fetchone()
+        task_row=db.execute('SELECT publication,created FROM tasks WHERE id=?',(row['task_id'],)).fetchone()
         was_published=bool(task_row and task_row['publication'] in ('active','superseded'))
         if pin_count>0:
             restored='available' if (state=='available' or was_published) else 'staged_candidate'
             db.execute('UPDATE attempts SET media_state=?,gc_eligible_since=NULL WHERE id=?',(restored,attempt_id))
             return restored
-        if retention_enabled and state in ('staged_candidate','available'):
-            since=row['gc_eligible_since'] if row['gc_eligible_since'] is not None else now
-            db.execute("UPDATE attempts SET media_state='gc_eligible',gc_eligible_since=? WHERE id=?",(since,attempt_id))
-            return 'gc_eligible'
-        if not retention_enabled and state=='gc_eligible':
-            restored='available' if was_published else 'staged_candidate'
-            db.execute('UPDATE attempts SET media_state=?,gc_eligible_since=NULL WHERE id=?',(restored,attempt_id))
-            return restored
+        if not retention_enabled:
+            if state=='gc_eligible':
+                restored='available' if was_published else 'staged_candidate'
+                db.execute('UPDATE attempts SET media_state=?,gc_eligible_since=NULL WHERE id=?',(restored,attempt_id))
+                return restored
+            return state
+        att_body=json.loads(row['body']) if row['body'] else {}
+        unpinned_at=float(att_body.get('unpinned_at') or 0.0)
+        if was_published:
+            rollback_ttl=retention_cfg.get('rollback_ttl_seconds')
+            if rollback_ttl is None:
+                # Superseded serving remains permanent by default even if rollback pin is absent.
+                if state!='available' or row['gc_eligible_since'] is not None:
+                    db.execute("UPDATE attempts SET media_state='available',gc_eligible_since=NULL WHERE id=?",(attempt_id,))
+                return 'available'
+            base_ts=float(att_body.get('superseded_at') or att_body.get('finished_at') or (task_row['created'] if task_row else now) or now)
+            eligible_at=max(base_ts+float(rollback_ttl),unpinned_at)
+            if now>=eligible_at:
+                since=row['gc_eligible_since'] if row['gc_eligible_since'] is not None else eligible_at
+                db.execute("UPDATE attempts SET media_state='gc_eligible',gc_eligible_since=? WHERE id=?",(since,attempt_id))
+                return 'gc_eligible'
+            if state=='gc_eligible':
+                db.execute("UPDATE attempts SET media_state='available',gc_eligible_since=NULL WHERE id=?",(attempt_id,))
+                return 'available'
+            return state
+        cand_ttl=float(retention_cfg.get('candidate_ttl_seconds',14*86400))
+        base_ts=float(att_body.get('staged_at') or att_body.get('finished_at') or (task_row['created'] if task_row else now) or now)
+        eligible_at=max(base_ts+cand_ttl,unpinned_at)
+        if state in ('staged_candidate','available','gc_eligible'):
+            if now>=eligible_at:
+                since=row['gc_eligible_since'] if row['gc_eligible_since'] is not None else eligible_at
+                db.execute("UPDATE attempts SET media_state='gc_eligible',gc_eligible_since=? WHERE id=?",(since,attempt_id))
+                return 'gc_eligible'
+            if state=='gc_eligible':
+                db.execute("UPDATE attempts SET media_state='staged_candidate',gc_eligible_since=NULL WHERE id=?",(attempt_id,))
+                return 'staged_candidate'
         return state
 
     def pin_attempt(self, attempt_id, holder_kind, holder_id, ttl_seconds=None, metadata=None, retention_enabled=None):
@@ -301,6 +341,9 @@ class Store:
             if not row:
                 raise KeyError('attempt_not_found')
             db.execute("DELETE FROM artifact_pins WHERE target_type='attempt' AND target_id=? AND holder_kind=? AND holder_id=?",(attempt_id,holder_kind,holder_id))
+            att_body=json.loads(row['body']) if row['body'] else {}
+            att_body['unpinned_at']=self.clock()
+            db.execute('UPDATE attempts SET body=? WHERE id=?',(encode(att_body),attempt_id))
             self.expire_pins(db,retention_enabled=retention_enabled)
             self._recompute_attempt_media_state(db,attempt_id,retention_enabled=retention_enabled)
             updated=db.execute('SELECT * FROM attempts WHERE id=?',(attempt_id,)).fetchone()
