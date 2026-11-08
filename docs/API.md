@@ -8,22 +8,31 @@ token from private server config. Never mirror credentials.
 
 | Method and route | Request / behavior |
 | --- | --- |
-| POST `/workers/register` | display_name, platform, worker_version, capabilities[], accessible_storage_ids[]. Returns individual worker ID/token. |
-| POST `/workers/{id}/heartbeat` | increasing sequence; optional active `{attempt_id,lease_token}`, stage, last_progress_at, compact local_state. Returns server_time/lease_expires_at/cancel/pause_new_tasks. |
-| POST `/workers/{id}/claims` | request_id. 200 assignment or 204 idle. Busy worker gets its current assignment. |
+| POST `/workers/register` | display_name, platform, worker_version, capabilities[], accessible_storage_ids[]. Returns individual worker ID/token (or refreshes existing authenticated worker). |
+| POST `/workers/{id}/profile` | Authenticated worker capability/runtime profile refresh (`capabilities`, `accessible_storage_ids`, `worker_version`, `runtime`) preserving worker ID and lease state. |
+| POST `/workers/{id}/heartbeat` | increasing sequence; optional active `{attempt_id,lease_token}`, stage, last_progress_at, compact local_state, optional capability/runtime refresh. Returns server_time/lease_expires_at/cancel/pause_new_tasks. |
+| POST `/workers/{id}/claims` | request_id. 200 assignment or 204 idle. Busy worker gets its current assignment. Enforces derived `required_capabilities` (`cut-constraints-v1`) and `required_storage_ids` (`processing`). |
 | GET `/attempts/{id}` | Assigned worker only; lease status and acknowledged event sequence. |
 | POST `/attempts/{id}/events` | lease_token, events[] with contiguous sequence, type, stage and compact metadata. Replays must match exactly. |
-| POST `/attempts/{id}/complete` | Idempotency-Key; task_id, source_sha256, lease_token, final_event_sequence, timing, result_ref or dryrun findings. |
+| POST `/attempts/{id}/complete` | Idempotency-Key; task_id, source_sha256, lease_token, final_event_sequence, timing, result_ref or dryrun findings. Independently validates `heuristic-diagnostics.json` (`<=512 KiB`). |
 | POST `/attempts/{id}/fail` | Idempotency-Key; task_id, lease_token, final_event_sequence, error_code, retryable, timing. |
+| GET `/attempts/{id}/heuristics` | Verified `heuristic-diagnostics.json` summary for an attempt. |
+| GET/POST/DELETE `/attempts/{id}/pins` | Per-holder retention pins (`holder_kind`, `holder_id`, `ttl_seconds?`). Returns confirmed `media_state` and `pin_summary`; rejects `quarantined`/`evicted` attempts with 409. |
 | GET `/sources` | Discovered/registered original file references. |
 | POST `/sources` | storage_id=originals, relative path, optional known sha256; stat file generation. |
-| POST `/tasks` | Idempotency-Key; source_id, type, parameters, priority?, max_attempts?, publication_policy=never/if_no_active_result. |
+| GET `/sources/{id}/versions` | Verified output-version catalog for a 32-hex server `source_id`. |
+| GET `/videos/{source_sha256}/versions` | Verified output-version catalog for a 64-hex `source_sha256` (`id`, `manifest`, `media_state`, `publication_status`, `playable`, `pin_summary`). |
+| GET/POST `/feedback-snapshots` | Immutable cut-feedback snapshot (`<=128 KiB` inbound, rejects malformed/contradictory with 422, embeds verified `base_manifest` `<=256 KiB` at `processing/snapshots/<source_sha256>/<sha256>.json`, pins `base_attempt_id`). |
+| GET `/feedback-snapshots/{id}` | Snapshot metadata and payload by `snapshot_id` (`fbs_…`) or `snapshot_sha256`. |
+| POST `/tasks` | Idempotency-Key; source_id, type, parameters, optional `feedback_snapshot_id`, priority?, max_attempts?, publication_policy=never/if_no_active_result. |
 | GET `/tasks` | Filters status/source_id/type; cursor offset, limit <=100. |
-| GET `/tasks/{id}` | Specification, all attempts/events/results, publication state. |
-| POST `/tasks/{id}/rerun` | Idempotency-Key; parameter/type overrides. New task, default never auto-publish. |
+| GET `/tasks/{id}` | Specification, all attempts/events/results, `media_state`, publication state. |
+| POST `/tasks/{id}/rerun` | Idempotency-Key; parameter/type overrides or `feedback_snapshot_id`. Expands verified `cut_constraints_ref`, derives `cut-constraints-v1`, forces `publication_policy=never`. |
 | POST `/tasks/{id}/cancel` | expected_version. Queued cancellation or cooperative cancel request. |
+| POST `/tasks/{id}/stage-candidate` | Explicit candidate staging to `library/media/<attempt>` and `library/metadata/candidates/<sha256>/<attempt>.json` without changing active serving. |
 | GET `/tasks/{id}/activation-preview` | Current active attempt for compare-and-swap activation. |
-| POST `/tasks/{id}/activate` | expected_active_attempt (null/legacy/attempt ID). Process results only; idempotent for already active result. |
+| POST `/tasks/{id}/activate` | expected_active_attempt (null/legacy/attempt ID). Replay-safe activation from staging or `staged_candidate`; converts previous serving pin to `rollback_previous`. |
+| POST `/retention/sweep` | Disabled-by-default candidate retention sweep and crash recovery for `quarantined` attempts. |
 | GET `/workers` | Sanitized workers/snapshots; last seen and last progress separately. |
 | PATCH `/workers/{id}` | paused, expected_version; pause affects future assignments. |
 | GET/POST `/watchers` | storage_id=originals, relative path, enabled (default false), settle_seconds, parameters. |
