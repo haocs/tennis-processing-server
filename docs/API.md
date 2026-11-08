@@ -62,3 +62,7 @@ Server lifecycle: queued -> leased -> running -> succeeded/failed/cancelled;
 transient failure/lost attempt -> retry_wait -> queued. Server owns retries.
 Publication states are separate: not_requested/pending/active/superseded/failed.
 Task history is retained even when newer processing becomes active.
+
+Version catalogs support `cursor`, `limit` (1–50), and `video_version_id`. Responses return `next_cursor` and are additionally bounded by encoded metadata size; clients follow pages rather than downloading unbounded run histories. Exact-version lookups avoid fetching unrelated full descriptors.
+
+Cleanup starts its grace period when an eligible attempt is first marked, even if its TTL expired while the server was offline. A migration to these retention fields changes the attempts schema: back up stopped server state before deployment, and restore that matching backup when rolling back to an older container whose SQL predates these columns. This source change does not perform a deployment.

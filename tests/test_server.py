@@ -732,3 +732,28 @@ def test_cleanup_enabled_for_old_candidate_still_starts_a_full_grace_window(env)
     with store.tx() as db:assert db.execute('SELECT gc_eligible_since FROM attempts WHERE id=?',(a['id'],)).fetchone()[0]==clock[0]
     clock[0]+=86400-1;assert files.run_retention(store)['evicted']==[]
     clock[0]+=2;assert a['id'] in files.run_retention(store)['evicted']
+
+
+def test_version_catalog_is_paginated_and_supports_exact_version_lookup(env):
+    app,c,h,s,cfg=env;w,wh=worker(c);digest=hashlib.sha256(b'input').hexdigest()
+    for i in range(2):
+        t=task(c,h,s,'process','catalog-'+str(i));a=claim(c,w,wh)['attempt'];_write_process_attempt_bundle(cfg,t,a['id'],digest,published_at=1700000000.0+i)
+        r=c.post('/api/v1/attempts/'+a['id']+'/complete',json={'task_id':t,'lease_token':a['lease_token'],'final_event_sequence':0,'source_sha256':digest,'result_ref':{'storage_id':'processing','path':f'runs/{t}/{a["id"]}/result.json'}},headers=dict(wh,**{'Idempotency-Key':'catalog-complete-'+str(i)}));assert r.status_code==200
+        assert c.post('/api/v1/tasks/'+t+'/stage-candidate',json={},headers=h).status_code==200
+    first=c.get('/api/v1/videos/'+digest+'/versions?limit=1').json;assert len(first['items'])==1 and first['next_cursor']==1
+    second=c.get('/api/v1/videos/'+digest+'/versions?limit=1&cursor=1').json;assert len(second['items'])==1 and second['next_cursor'] is None
+    assert first['items'][0]['id']!=second['items'][0]['id']
+    exact=c.get('/api/v1/videos/'+digest+'/versions?video_version_id='+second['items'][0]['id']).json;assert exact['items'][0]['id']==second['items'][0]['id'] and len(exact['items'])==1
+
+
+def test_parallel_startup_migrates_legacy_attempts_without_losing_history(tmp_path):
+    import sqlite3
+    from store import Store
+    path=tmp_path/'legacy.sqlite3'
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE attempts(id TEXT PRIMARY KEY,task_id TEXT,worker_id TEXT,token TEXT,expires REAL,status TEXT,number INTEGER,body TEXT,result TEXT)')
+        db.execute('INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?)',('old','task','worker','fixture-token',1234,'running',1,'{"preserved":true}',None))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(lambda _:Store(path),range(4)))
+    with sqlite3.connect(path) as db:
+        row=db.execute('SELECT id,body,media_state FROM attempts').fetchone();assert row==('old','{"preserved":true}','unknown')
+        assert db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0]==1

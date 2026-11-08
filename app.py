@@ -186,15 +186,30 @@ def create_app(config=None):
         b={'storage_id':b['storage_id'],'path':b['path'],'bytes':stat.st_size,'modified_ns':stat.st_mtime_ns,'sha256':b.get('sha256')}
         return jsonify(source_id=store.source(b)),201
 
+    def version_page(items):
+        try:offset=int(request.args.get('cursor','0'));limit=int(request.args.get('limit','50'))
+        except ValueError:raise ValueError('invalid_catalog_page')
+        if offset<0 or not 1<=limit<=50:raise ValueError('invalid_catalog_page')
+        selected_version=request.args.get('video_version_id')
+        if selected_version:items=[item for item in items if item['id']==selected_version]
+        page=[];size=0
+        for item in items[offset:offset+limit]:
+            length=len(encode(item).encode())
+            if length>384*1024:raise ValueError('version_descriptor_too_large')
+            if page and size+length>384*1024:break
+            page.append(item);size+=length
+        end=offset+len(page)
+        return jsonify(items=page,next_cursor=end if end<len(items) else None)
+
     @app.get('/api/v1/sources/<identity>/versions')
     def source_versions(identity):
         inc=request.args.get('include_non_playable')=='1'
-        return jsonify(items=files.list_video_versions(store,source_id=identity,include_non_playable=inc))
+        return version_page(files.list_video_versions(store,source_id=identity,include_non_playable=inc))
 
     @app.get('/api/v1/videos/<source_sha256>/versions')
     def video_versions(source_sha256):
         inc=request.args.get('include_non_playable')=='1'
-        return jsonify(items=files.list_video_versions(store,source_sha256=source_sha256,include_non_playable=inc))
+        return version_page(files.list_video_versions(store,source_sha256=source_sha256,include_non_playable=inc))
 
     @app.post('/api/v1/feedback-snapshots')
     def create_snapshot():

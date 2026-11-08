@@ -12,3 +12,5 @@
 !templates/*
 !legacy.py
 !manage.py
+
+!feedback.py

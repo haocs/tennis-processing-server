@@ -60,6 +60,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS feedback_snapshots(id TEXT PRIMARY KEY,source_id TEXT NOT NULL,source_sha256 TEXT NOT NULL,base_task_id TEXT NOT NULL,base_attempt_id TEXT NOT NULL,base_video_version_id TEXT NOT NULL,snapshot_sha256 TEXT NOT NULL UNIQUE,storage_ref TEXT NOT NULL,body TEXT NOT NULL,created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS artifact_pins(target_type TEXT NOT NULL,target_id TEXT NOT NULL,source_sha256 TEXT NOT NULL,holder_kind TEXT NOT NULL,holder_id TEXT NOT NULL,created REAL NOT NULL,expires REAL,metadata TEXT,PRIMARY KEY(target_type,target_id,holder_kind,holder_id));
             ''')
+            # executescript commits its input transaction; reacquire the write lock
+            # before inspecting/altering a legacy schema during multi-process startup.
+            db.execute('BEGIN IMMEDIATE')
             cols = {r['name'] for r in db.execute('PRAGMA table_info(attempts)').fetchall()}
             if 'media_state' not in cols:
                 db.execute("ALTER TABLE attempts ADD COLUMN media_state TEXT DEFAULT 'unknown'")
