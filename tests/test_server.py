@@ -651,6 +651,8 @@ def test_pin_isolation_opaque_holders_and_fenced_quarantine_recovery(env):
     shutil.rmtree(lib/'media'/a_sym['id'])
     (lib/'media'/a_sym['id']).symlink_to(lib/'media'/a_victim['id'])
     clock[0]+=14*86400+100.0
+    assert c.post('/api/v1/retention/sweep',json={},headers=h).json['evicted']==[]  # First transition starts grace now.
+    clock[0]+=100.0
     sweep_sym=c.post('/api/v1/retention/sweep',json={},headers=h).json
     assert a_sym['id'] in sweep_sym['conflicts']
     assert a_sym['id'] not in sweep_sym['evicted']
@@ -711,3 +713,18 @@ def test_portal_stage_for_comparison_and_task_pin_media_state_exposure(env):
     detail=c.get('/api/v1/tasks/'+t).json
     assert detail['attempts'][0]['media_state']=='staged_candidate'
     assert detail['attempts'][0]['pin_summary']['active_pin_count']==1
+
+
+def test_cleanup_enabled_for_old_candidate_still_starts_a_full_grace_window(env):
+    app,c,h,s,cfg=env;store=app.config['STORE'];files=app.config['FILES'];clock=[1000.0];store.clock=lambda:clock[0]
+    w,wh=worker(c);digest=hashlib.sha256(b'input').hexdigest();t=task(c,h,s,'process','old-candidate');a=claim(c,w,wh)['attempt']
+    _write_process_attempt_bundle(cfg,t,a['id'],digest)
+    result={'task_id':t,'lease_token':a['lease_token'],'final_event_sequence':0,'source_sha256':digest,'result_ref':{'storage_id':'processing','path':f'runs/{t}/{a["id"]}/result.json'}}
+    assert c.post('/api/v1/attempts/'+a['id']+'/complete',json=result,headers=dict(wh,**{'Idempotency-Key':'old-complete'})).status_code==200
+    assert c.post('/api/v1/tasks/'+t+'/stage-candidate',json={},headers=h).status_code==200
+    clock[0]+=40*86400;cfg['retention']={'enabled':True};store.retention=cfg['retention']
+    # A long-offline server or newly enabled cleanup must not backdate grace.
+    first=files.run_retention(store);assert first['evicted']==[]
+    with store.tx() as db:assert db.execute('SELECT gc_eligible_since FROM attempts WHERE id=?',(a['id'],)).fetchone()[0]==clock[0]
+    clock[0]+=86400-1;assert files.run_retention(store)['evicted']==[]
+    clock[0]+=2;assert a['id'] in files.run_retention(store)['evicted']

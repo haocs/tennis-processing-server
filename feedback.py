@@ -42,7 +42,7 @@ def validate_snapshot(payload,base):
     def fail(message):raise InvalidFeedback(message)
     if not isinstance(payload,dict):fail('invalid_feedback_snapshot')
     allowed={'schema_version','source_sha256','base_task_id','base_attempt_id','base_video_version_id','selected_evidence_revisions','confirmed_commands','parameter_overrides','compiler_version'}
-    if set(payload)-allowed or payload.get('schema_version',1)!=1:fail('invalid_feedback_snapshot')
+    if set(payload)-allowed or type(payload.get('schema_version',1)) is not int or payload.get('schema_version',1)!=1:fail('invalid_feedback_snapshot')
     try:raw=canonical(payload)
     except (ValueError,TypeError):fail('invalid_feedback_json')
     if len(raw)>MAX_BYTES:fail('feedback_snapshot_too_large')
@@ -163,7 +163,7 @@ def validate_heuristics(data,raw_size,source_sha256,attempt_id,task_id=None,publ
     """Independently verify worker heuristic-diagnostics.json <= 512 KiB and contract invariants."""
     if raw_size>MAX_HEURISTICS_BYTES:
         raise ValueError('heuristic_diagnostics_too_large')
-    if not isinstance(data,dict) or data.get('schema_version')!=1:
+    if not isinstance(data,dict) or type(data.get('schema_version')) is not int or data.get('schema_version')!=1:
         raise ValueError('invalid_heuristic_diagnostics')
     try:
         raw_canonical=canonical(data)

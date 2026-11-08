@@ -274,7 +274,7 @@ class Store:
             base_ts=float(att_body.get('superseded_at') or att_body.get('finished_at') or (task_row['created'] if task_row else now) or now)
             eligible_at=max(base_ts+float(rollback_ttl),unpinned_at)
             if now>=eligible_at:
-                since=row['gc_eligible_since'] if row['gc_eligible_since'] is not None else eligible_at
+                since=row['gc_eligible_since'] if row['gc_eligible_since'] is not None else now
                 db.execute("UPDATE attempts SET media_state='gc_eligible',gc_eligible_since=? WHERE id=?",(since,attempt_id))
                 return 'gc_eligible'
             if state=='gc_eligible':
@@ -286,7 +286,7 @@ class Store:
         eligible_at=max(base_ts+cand_ttl,unpinned_at)
         if state in ('staged_candidate','available','gc_eligible'):
             if now>=eligible_at:
-                since=row['gc_eligible_since'] if row['gc_eligible_since'] is not None else eligible_at
+                since=row['gc_eligible_since'] if row['gc_eligible_since'] is not None else now
                 db.execute("UPDATE attempts SET media_state='gc_eligible',gc_eligible_since=? WHERE id=?",(since,attempt_id))
                 return 'gc_eligible'
             if state=='gc_eligible':
