@@ -96,6 +96,9 @@ def validate_snapshot(payload,base):
             interval=(start,end)
             if override:
                 if row['clip_id'] not in clips:fail('override_clip_not_in_base')
+                base_clip=clips[row['clip_id']]
+                base_span=(round(base_clip['original_start_seconds']*1000),round(base_clip['original_end_seconds']*1000))
+                if not overlaps(interval,base_span) or any(overlaps(interval,(round(c['original_start_seconds']*1000),round(c['original_end_seconds']*1000))) for key,c in clips.items() if key!=row['clip_id']):fail('override_crosses_base_clip')
                 if row['clip_id'] in seen_clips or any(overlaps(interval,old) for old in overrides):fail('contradictory_constraints')
                 seen_clips.add(row['clip_id']);overrides.append(interval)
             (negative if kind=='exclude_intervals_ms' else positive).append(interval);count+=1

@@ -757,3 +757,15 @@ def test_parallel_startup_migrates_legacy_attempts_without_losing_history(tmp_pa
     with sqlite3.connect(path) as db:
         row=db.execute('SELECT id,body,media_state FROM attempts').fetchone();assert row==('old','{"preserved":true}','unknown')
         assert db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0]==1
+
+
+def test_boundary_override_cannot_erase_an_unrelated_base_clip():
+    from feedback import validate_snapshot,InvalidFeedback
+    digest='a'*64;attempt='b'*32;p=_valid_snapshot_payload(digest,attempt)
+    p['selected_evidence_revisions']=p['selected_evidence_revisions'][:1]
+    base={'id':digest,'published_at':1700000000.0,'processing':{'attempt_id':attempt},'source':{'sha256':digest,'duration_seconds':10},'clips':[{'id':'clip_1','original_start_seconds':1,'original_end_seconds':4},{'id':'clip_2','original_start_seconds':6,'original_end_seconds':9}]}
+    for a,b in ((2000,8000),(7000,8000),(4000,5000)):
+        p['confirmed_commands']={'keep_intervals_ms':[],'exclude_intervals_ms':[],'override_clip_bounds_ms':[dict(clip_id='clip_1',original_start_ms=a,original_end_ms=b,source_annotation_id='ann_clip_1',source_revision=1)]}
+        with pytest.raises(InvalidFeedback,match='override_crosses_base_clip'):validate_snapshot(p,base)
+    p['confirmed_commands']['override_clip_bounds_ms'][0].update(original_start_ms=1200,original_end_ms=4500)
+    assert validate_snapshot(p,base)['confirmed_commands']['override_clip_bounds_ms'][0]['original_end_ms']==4500

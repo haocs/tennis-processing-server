@@ -43,35 +43,38 @@ class Store:
     def __init__(self, path, clock=time.time, retention=None):
         self.path, self.clock = str(path), clock
         self.retention = retention or {}
-        with self.tx() as db:
-            db.executescript('''
-            CREATE TABLE IF NOT EXISTS workers(id TEXT PRIMARY KEY, secret TEXT, body TEXT, seen REAL, sequence INTEGER DEFAULT 0, paused INTEGER DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY, body TEXT, signature TEXT UNIQUE);
-            CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, source_id TEXT, body TEXT, status TEXT, created REAL, version INTEGER DEFAULT 1, attempt TEXT, available REAL DEFAULT 0, result TEXT, publication TEXT DEFAULT 'not_requested');
-            CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, task_id TEXT, worker_id TEXT, token TEXT, expires REAL, status TEXT, number INTEGER, body TEXT, result TEXT, media_state TEXT DEFAULT 'unknown', gc_eligible_since REAL, media_evicted_at REAL);
-            CREATE TABLE IF NOT EXISTS events(attempt_id TEXT, sequence INTEGER, body TEXT, PRIMARY KEY(attempt_id,sequence));
-            CREATE TABLE IF NOT EXISTS requests(scope TEXT,key TEXT,body TEXT,response TEXT,PRIMARY KEY(scope,key));
-            CREATE TABLE IF NOT EXISTS watchers(id TEXT PRIMARY KEY,body TEXT,version INTEGER DEFAULT 1);
-            CREATE TABLE IF NOT EXISTS observations(watcher_id TEXT,path TEXT,signature TEXT,stable REAL,PRIMARY KEY(watcher_id,path));
-            CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,body TEXT);
-            CREATE TABLE IF NOT EXISTS publication_intents(task_id TEXT PRIMARY KEY,body TEXT,status TEXT);
-            CREATE TABLE IF NOT EXISTS staging_intents(task_id TEXT PRIMARY KEY,body TEXT,status TEXT);
-            CREATE TABLE IF NOT EXISTS publications(source_hash TEXT PRIMARY KEY,attempt_id TEXT,version INTEGER DEFAULT 1);
-            CREATE TABLE IF NOT EXISTS feedback_snapshots(id TEXT PRIMARY KEY,source_id TEXT NOT NULL,source_sha256 TEXT NOT NULL,base_task_id TEXT NOT NULL,base_attempt_id TEXT NOT NULL,base_video_version_id TEXT NOT NULL,snapshot_sha256 TEXT NOT NULL UNIQUE,storage_ref TEXT NOT NULL,body TEXT NOT NULL,created REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS artifact_pins(target_type TEXT NOT NULL,target_id TEXT NOT NULL,source_sha256 TEXT NOT NULL,holder_kind TEXT NOT NULL,holder_id TEXT NOT NULL,created REAL NOT NULL,expires REAL,metadata TEXT,PRIMARY KEY(target_type,target_id,holder_kind,holder_id));
-            ''')
-            # executescript commits its input transaction; reacquire the write lock
-            # before inspecting/altering a legacy schema during multi-process startup.
-            db.execute('BEGIN IMMEDIATE')
-            cols = {r['name'] for r in db.execute('PRAGMA table_info(attempts)').fetchall()}
-            if 'media_state' not in cols:
-                db.execute("ALTER TABLE attempts ADD COLUMN media_state TEXT DEFAULT 'unknown'")
-            if 'gc_eligible_since' not in cols:
-                db.execute('ALTER TABLE attempts ADD COLUMN gc_eligible_since REAL')
-            if 'media_evicted_at' not in cols:
-                db.execute('ALTER TABLE attempts ADD COLUMN media_evicted_at REAL')
-            # Legacy attempts migrate as 'unknown' (never blindly 'available'); only failed/cancelled/dryrun are 'never_rendered'.
-            db.execute("UPDATE attempts SET media_state='never_rendered' WHERE media_state='unknown' AND (status IN ('failed','cancelled') OR task_id IN (SELECT id FROM tasks WHERE json_extract(body,'$.type')='dryrun'))")
+        import fcntl
+        with open(self.path+'.schema.lock','a') as schema_lock:
+            fcntl.flock(schema_lock,fcntl.LOCK_EX)
+            with self.tx() as db:
+                db.executescript('''
+                CREATE TABLE IF NOT EXISTS workers(id TEXT PRIMARY KEY, secret TEXT, body TEXT, seen REAL, sequence INTEGER DEFAULT 0, paused INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY, body TEXT, signature TEXT UNIQUE);
+                CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, source_id TEXT, body TEXT, status TEXT, created REAL, version INTEGER DEFAULT 1, attempt TEXT, available REAL DEFAULT 0, result TEXT, publication TEXT DEFAULT 'not_requested');
+                CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, task_id TEXT, worker_id TEXT, token TEXT, expires REAL, status TEXT, number INTEGER, body TEXT, result TEXT, media_state TEXT DEFAULT 'unknown', gc_eligible_since REAL, media_evicted_at REAL);
+                CREATE TABLE IF NOT EXISTS events(attempt_id TEXT, sequence INTEGER, body TEXT, PRIMARY KEY(attempt_id,sequence));
+                CREATE TABLE IF NOT EXISTS requests(scope TEXT,key TEXT,body TEXT,response TEXT,PRIMARY KEY(scope,key));
+                CREATE TABLE IF NOT EXISTS watchers(id TEXT PRIMARY KEY,body TEXT,version INTEGER DEFAULT 1);
+                CREATE TABLE IF NOT EXISTS observations(watcher_id TEXT,path TEXT,signature TEXT,stable REAL,PRIMARY KEY(watcher_id,path));
+                CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,body TEXT);
+                CREATE TABLE IF NOT EXISTS publication_intents(task_id TEXT PRIMARY KEY,body TEXT,status TEXT);
+                CREATE TABLE IF NOT EXISTS staging_intents(task_id TEXT PRIMARY KEY,body TEXT,status TEXT);
+                CREATE TABLE IF NOT EXISTS publications(source_hash TEXT PRIMARY KEY,attempt_id TEXT,version INTEGER DEFAULT 1);
+                CREATE TABLE IF NOT EXISTS feedback_snapshots(id TEXT PRIMARY KEY,source_id TEXT NOT NULL,source_sha256 TEXT NOT NULL,base_task_id TEXT NOT NULL,base_attempt_id TEXT NOT NULL,base_video_version_id TEXT NOT NULL,snapshot_sha256 TEXT NOT NULL UNIQUE,storage_ref TEXT NOT NULL,body TEXT NOT NULL,created REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS artifact_pins(target_type TEXT NOT NULL,target_id TEXT NOT NULL,source_sha256 TEXT NOT NULL,holder_kind TEXT NOT NULL,holder_id TEXT NOT NULL,created REAL NOT NULL,expires REAL,metadata TEXT,PRIMARY KEY(target_type,target_id,holder_kind,holder_id));
+                ''')
+                # executescript commits its input transaction; reacquire the write lock
+                # before inspecting/altering a legacy schema during multi-process startup.
+                db.execute('BEGIN IMMEDIATE')
+                cols = {r['name'] for r in db.execute('PRAGMA table_info(attempts)').fetchall()}
+                if 'media_state' not in cols:
+                    db.execute("ALTER TABLE attempts ADD COLUMN media_state TEXT DEFAULT 'unknown'")
+                if 'gc_eligible_since' not in cols:
+                    db.execute('ALTER TABLE attempts ADD COLUMN gc_eligible_since REAL')
+                if 'media_evicted_at' not in cols:
+                    db.execute('ALTER TABLE attempts ADD COLUMN media_evicted_at REAL')
+                # Legacy attempts migrate as 'unknown' (never blindly 'available'); only failed/cancelled/dryrun are 'never_rendered'.
+                db.execute("UPDATE attempts SET media_state='never_rendered' WHERE media_state='unknown' AND (status IN ('failed','cancelled') OR task_id IN (SELECT id FROM tasks WHERE json_extract(body,'$.type')='dryrun'))")
 
     @property
     def retention_enabled(self):
