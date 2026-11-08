@@ -587,13 +587,17 @@ def test_pin_isolation_opaque_holders_and_fenced_quarantine_recovery(env):
     assert c.get('/api/v1/attempts/'+a['id']+'/pins').json['media_state']=='staged_candidate'
     assert c.post('/api/v1/retention/sweep',json={},headers=h).json['evicted']==[]
 
-    # Advance clock past 14-day candidate TTL -> becomes gc_eligible; re-pinning restores staged_candidate
+    # Advance clock past 14-day candidate TTL -> becomes gc_eligible; re-pinning clears gc_eligible_since and unpinning starts fresh grace
     clock[0]=2000.0+14*86400+1
-    assert c.get('/api/v1/attempts/'+a['id']+'/pins').json['media_state']=='gc_eligible'
+    first_elig=c.get('/api/v1/attempts/'+a['id']+'/pins').json
+    assert first_elig['media_state']=='gc_eligible' and first_elig['pin_summary']['gc_eligible_since']==clock[0]
+    clock[0]+=10.0
+    assert c.get('/api/v1/attempts/'+a['id']+'/pins').json['pin_summary']['gc_eligible_since']==first_elig['pin_summary']['gc_eligible_since']
     repin=c.post('/api/v1/attempts/'+a['id']+'/pins',json={'holder_kind':'operator_manual','holder_id':'op1'},headers=h).json
-    assert repin['media_state']=='staged_candidate'
-    c.delete('/api/v1/attempts/'+a['id']+'/pins/operator_manual/op1',headers={'X-Tennis-Request':'1'})
-    assert c.get('/api/v1/attempts/'+a['id']+'/pins').json['media_state']=='gc_eligible'
+    assert repin['media_state']=='staged_candidate' and repin['pin_summary']['gc_eligible_since'] is None
+    clock[0]+=20.0
+    unpin_res=c.delete('/api/v1/attempts/'+a['id']+'/pins/operator_manual/op1',headers={'X-Tennis-Request':'1'}).json
+    assert unpin_res['media_state']=='gc_eligible' and unpin_res['pin_summary']['gc_eligible_since']==clock[0]
 
     # Advance past 60s grace period and run retention sweep -> evicted
     clock[0]+=100.0
