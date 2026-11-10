@@ -45,13 +45,19 @@ def tick(store,files):
     with store.tx() as db:
         store.expire(db)
         watchers=[r['id'] for r in db.execute("SELECT id FROM watchers WHERE json_extract(body,'$.enabled')=1")]
+        stagings=[r['task_id'] for r in db.execute("SELECT s.task_id FROM staging_intents s JOIN tasks t ON t.id=s.task_id WHERE s.status='pending' AND t.status='succeeded'")]
         publications=[dict(r) for r in db.execute("SELECT t.id,i.body AS intent FROM tasks t LEFT JOIN publication_intents i ON i.task_id=t.id WHERE t.publication='pending' AND t.status='succeeded'")]
     for identity in watchers: scan(store,files,identity)
+    for task_id in stagings:
+        try: files.stage_candidate(store,task_id)
+        except (OSError,ValueError,KeyError,Conflict): pass
     for publication in publications:
         identity=publication['id'];intent=json.loads(publication['intent']) if publication['intent'] else {}
         try: files.activate(store,identity,intent.get('expected_active'),policy=intent.get('policy','if_no_active_result'))
         except (OSError,ValueError,KeyError,Conflict):
             with store.tx() as db: db.execute("UPDATE tasks SET publication='failed' WHERE id=?",(identity,))
+    try: files.run_retention(store)
+    except OSError: pass
 
     mirror_viewing_status(store,files)
 

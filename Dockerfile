@@ -3,7 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PROCESSING_CONFIG=/config/serve
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && groupadd -g 10001 processing && useradd -u 10001 -g processing -M processing
-COPY app.py store.py files.py scheduler.py start.py legacy.py manage.py ./
+COPY app.py store.py files.py feedback.py scheduler.py start.py legacy.py manage.py ./
 COPY static ./static
 COPY templates ./templates
 USER 10001:10001

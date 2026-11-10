@@ -34,7 +34,7 @@ def import_library(store,files):
             spec={'source_id':source,'type':'process','executor':'legacy','parameters':{},'priority':0,'max_attempts':1,'publication_policy':'never','trigger':'legacy_import','algorithm':data.get('algorithm'),'timing_unknown':True}
             task=store._enqueue(db,spec)['task_id'];attempt=uid()
             result={'legacy':True,'source_sha256':digest,'result_ref':reference,'timing':{'total_seconds':None,'stages':[],'measurement':'Historical processing timings unknown; imported publication only.'}}
-            db.execute('INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?)',(attempt,task,'legacy-import','',0,'succeeded',1,encode({'imported_at':store.clock()}),encode(result)))
+            db.execute("INSERT INTO attempts(id,task_id,worker_id,token,expires,status,number,body,result,media_state) VALUES(?,?,?,?,?,?,?,?,?,'unknown')",(attempt,task,'legacy-import','',0,'succeeded',1,encode({'imported_at':store.clock()}),encode(result)))
             db.execute("UPDATE tasks SET status='succeeded',attempt=?,result=?,publication='active' WHERE id=?",(attempt,encode(result),task))
             db.execute('INSERT OR IGNORE INTO publications VALUES(?,?,1)',(digest,attempt));imported+=1
     return {'imported':imported,'unmatched_sources':unmatched}
