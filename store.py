@@ -31,6 +31,124 @@ PIN_HOLDER_KINDS = {
     'operator_manual',
     'operator_manual_pin',
 }
+EXTERNAL_DOMAINS = ('coaching', 'exports')
+EXTERNAL_KINDS = (
+    'ai_coach',
+    'learning_plan',
+    'clip_interval_export',
+    'coaching_excerpt_render',
+)
+EXTERNAL_STATUSES = (
+    'queued',
+    'running',
+    'succeeded',
+    'failed',
+    'cancelled',
+)
+MAX_EXTERNAL_ITEMS = 250
+
+
+def _short_text(value, limit):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError('invalid_external_text')
+    text = ' '.join(value.split())
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _opt_float(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError('invalid_external_timestamp')
+    return float(value)
+
+
+def _sanitize_external_worker(raw, now):
+    if not isinstance(raw, dict) or not isinstance(raw.get('id'), str) or not raw['id'].strip():
+        raise ValueError('invalid_external_worker')
+    worker_id = raw['id'].strip()[:120]
+    seen = _opt_float(raw.get('last_seen', raw.get('seen')), now)
+    ttl = _opt_float(raw.get('ttl_seconds'), 120.0)
+    ttl = max(30.0, min(ttl, 3600.0))
+    seq = raw.get('sequence', 0)
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+        raise ValueError('invalid_external_worker')
+    body = {
+        'id': worker_id,
+        'role': _short_text(raw.get('role'), 64) or 'worker',
+        'label': _short_text(raw.get('label'), 120) or worker_id,
+        'online_reported': bool(raw.get('online', True)),
+        'ttl_seconds': ttl,
+        'busy': bool(raw.get('busy', False)),
+        'active_task': _short_text(raw.get('active_task'), 160),
+        'active_kind': _short_text(raw.get('active_kind'), 64),
+        'provider': _short_text(raw.get('provider'), 64),
+        'model': _short_text(raw.get('model'), 120),
+        'default_model': _short_text(raw.get('default_model'), 120),
+        'requested_model': _short_text(raw.get('requested_model'), 120),
+        'status_text': _short_text(raw.get('status_text'), 200),
+        'error': _short_text(raw.get('error'), 300),
+    }
+    if 'providers' in raw and raw['providers'] is not None:
+        body['providers'] = _validate_str_list(raw['providers'], 'invalid_external_worker')[:20]
+    if 'capabilities' in raw and raw['capabilities'] is not None:
+        body['capabilities'] = _validate_str_list(raw['capabilities'], 'invalid_external_worker')[:20]
+    return worker_id, seen, int(bool(raw.get('paused', False))), seq, {k: v for k, v in body.items() if v is not None and v != ''}
+
+
+def _sanitize_external_task(raw, domain, now):
+    if not isinstance(raw, dict):
+        raise ValueError('invalid_external_task')
+    identity = _short_text(raw.get('identity'), 160)
+    kind = raw.get('kind')
+    status = raw.get('status')
+    if not identity or kind not in EXTERNAL_KINDS or status not in EXTERNAL_STATUSES:
+        raise ValueError('invalid_external_task')
+    created = _opt_float(raw.get('created'), now)
+    updated = _opt_float(raw.get('updated'), created)
+    attempts = raw.get('attempts')
+    if attempts is not None and (isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0):
+        raise ValueError('invalid_external_task')
+    meta = raw.get('metadata')
+    clean_meta = None
+    if meta is not None:
+        if not isinstance(meta, dict) or len(meta) > 20:
+            raise ValueError('invalid_external_task')
+        clean_meta = {}
+        for k, v in meta.items():
+            if isinstance(k, str) and len(k) <= 48 and isinstance(v, (str, int, float, bool)):
+                clean_meta[k] = v[:200] if isinstance(v, str) else v
+    body = {
+        'domain': domain,
+        'identity': identity,
+        'kind': kind,
+        'status': status,
+        'raw_status': _short_text(raw.get('raw_status'), 40),
+        'title': _short_text(raw.get('title'), 200),
+        'summary': _short_text(raw.get('summary'), 320),
+        'worker_id': _short_text(raw.get('worker_id'), 120),
+        'worker_role': _short_text(raw.get('worker_role'), 64),
+        'session_id': _short_text(raw.get('session_id'), 120),
+        'session_name': _short_text(raw.get('session_name'), 160),
+        'provider': _short_text(raw.get('provider'), 64),
+        'model': _short_text(raw.get('model'), 120),
+        'stage': _short_text(raw.get('stage'), 80),
+        'attempts': attempts,
+        'error': _short_text(raw.get('error'), 500),
+        'error_code': _short_text(raw.get('error_code'), 80),
+        'error_detail': _short_text(raw.get('error_detail'), 800),
+        'started_at': _opt_float(raw.get('started_at')),
+        'finished_at': _opt_float(raw.get('finished_at')),
+        'created': created,
+        'updated': updated,
+        'metadata': clean_meta,
+    }
+    clean = {k: v for k, v in body.items() if v is not None and v != ''}
+    return identity, kind, status, created, updated, clean
 
 
 def _validate_str_list(items, error_code='invalid_capabilities'):
@@ -62,6 +180,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS publications(source_hash TEXT PRIMARY KEY,attempt_id TEXT,version INTEGER DEFAULT 1);
                 CREATE TABLE IF NOT EXISTS feedback_snapshots(id TEXT PRIMARY KEY,source_id TEXT NOT NULL,source_sha256 TEXT NOT NULL,base_task_id TEXT NOT NULL,base_attempt_id TEXT NOT NULL,base_video_version_id TEXT NOT NULL,snapshot_sha256 TEXT NOT NULL UNIQUE,storage_ref TEXT NOT NULL,body TEXT NOT NULL,created REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS artifact_pins(target_type TEXT NOT NULL,target_id TEXT NOT NULL,source_sha256 TEXT NOT NULL,holder_kind TEXT NOT NULL,holder_id TEXT NOT NULL,created REAL NOT NULL,expires REAL,metadata TEXT,PRIMARY KEY(target_type,target_id,holder_kind,holder_id));
+                CREATE TABLE IF NOT EXISTS external_workers(domain TEXT NOT NULL,id TEXT NOT NULL,seen REAL NOT NULL,paused INTEGER NOT NULL DEFAULT 0,sequence INTEGER NOT NULL DEFAULT 0,body TEXT NOT NULL,updated REAL NOT NULL,PRIMARY KEY(domain,id));
+                CREATE TABLE IF NOT EXISTS external_tasks(domain TEXT NOT NULL,identity TEXT NOT NULL,kind TEXT NOT NULL,status TEXT NOT NULL,worker_id TEXT,worker_role TEXT,session_id TEXT,session_name TEXT,provider TEXT,model TEXT,error TEXT,created REAL NOT NULL,updated REAL NOT NULL,body TEXT NOT NULL,PRIMARY KEY(domain,identity));
+                CREATE INDEX IF NOT EXISTS idx_external_tasks_sort ON external_tasks(updated DESC,created DESC);
                 ''')
                 # executescript commits its input transaction; reacquire the write lock
                 # before inspecting/altering a legacy schema during multi-process startup.
@@ -552,3 +673,103 @@ class Store:
     def workers(self):
         with self.tx() as db:
             return [dict(json.loads(r['body']),id=r['id'],last_seen=r['seen'],online=self.clock()-r['seen']<90,paused=bool(r['paused']),version=r['sequence']) for r in db.execute('SELECT * FROM workers ORDER BY seen DESC')]
+
+    def sync_external(self, domain, workers=None, tasks=None, deleted=None, snapshot=False, complete=True):
+        """Upsert or replace a sanitized external worker/task snapshot for one domain."""
+        if domain not in EXTERNAL_DOMAINS:
+            raise ValueError('invalid_external_domain')
+        now = self.clock()
+        if workers is not None and not isinstance(workers, list):
+            raise ValueError('invalid_external_workers')
+        if tasks is not None and not isinstance(tasks, list):
+            raise ValueError('invalid_external_tasks')
+        if deleted is not None and not isinstance(deleted, list):
+            raise ValueError('invalid_external_deleted')
+        if (workers and len(workers) > MAX_EXTERNAL_ITEMS) or (tasks and len(tasks) > MAX_EXTERNAL_ITEMS) or (deleted and len(deleted) > MAX_EXTERNAL_ITEMS):
+            raise ValueError('external_batch_too_large')
+        worker_rows = [_sanitize_external_worker(w, now) for w in (workers or [])]
+        task_rows = [_sanitize_external_task(t, domain, now) for t in (tasks or [])]
+        del_ids = []
+        for item in (deleted or []):
+            ident = _short_text(item, 160)
+            if not ident:
+                raise ValueError('invalid_external_deleted')
+            del_ids.append(ident)
+        with self.tx() as db:
+            if workers is not None:
+                if snapshot:
+                    keep = [w[0] for w in worker_rows]
+                    if keep:
+                        ph = ','.join('?' for _ in keep)
+                        db.execute(f'DELETE FROM external_workers WHERE domain=? AND id NOT IN ({ph})', [domain, *keep])
+                    else:
+                        db.execute('DELETE FROM external_workers WHERE domain=?', (domain,))
+                for wid, seen, paused, seq, clean in worker_rows:
+                    db.execute(
+                        'INSERT INTO external_workers(domain,id,seen,paused,sequence,body,updated) VALUES(?,?,?,?,?,?,?) ON CONFLICT(domain,id) DO UPDATE SET seen=excluded.seen,paused=excluded.paused,sequence=excluded.sequence,body=excluded.body,updated=excluded.updated',
+                        (domain, wid, seen, paused, seq, encode(clean), now),
+                    )
+            if tasks is not None:
+                for ident, kind, status, created, updated, clean in task_rows:
+                    db.execute(
+                        'INSERT INTO external_tasks(domain,identity,kind,status,worker_id,worker_role,session_id,session_name,provider,model,error,created,updated,body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(domain,identity) DO UPDATE SET kind=excluded.kind,status=excluded.status,worker_id=excluded.worker_id,worker_role=excluded.worker_role,session_id=excluded.session_id,session_name=excluded.session_name,provider=excluded.provider,model=excluded.model,error=excluded.error,created=excluded.created,updated=excluded.updated,body=excluded.body',
+                        (domain, ident, kind, status, clean.get('worker_id'), clean.get('worker_role'), clean.get('session_id'), clean.get('session_name'), clean.get('provider'), clean.get('model'), clean.get('error'), created, updated, encode(clean)),
+                    )
+                if snapshot and complete:
+                    keep_tasks = [t[0] for t in task_rows]
+                    if keep_tasks:
+                        ph = ','.join('?' for _ in keep_tasks)
+                        db.execute(f'DELETE FROM external_tasks WHERE domain=? AND identity NOT IN ({ph})', [domain, *keep_tasks])
+                    else:
+                        db.execute('DELETE FROM external_tasks WHERE domain=?', (domain,))
+            for ident in del_ids:
+                db.execute('DELETE FROM external_tasks WHERE domain=? AND identity=?', (domain, ident))
+        return {'domain': domain, 'workers': len(worker_rows) if workers is not None else 0, 'tasks': len(task_rows) if tasks is not None else 0, 'deleted': len(del_ids)}
+
+    def external_workers(self):
+        """Return mirrored workers with dynamic staleness evaluated on server clock."""
+        now = self.clock()
+        with self.tx() as db:
+            rows = db.execute('SELECT * FROM external_workers ORDER BY domain, id').fetchall()
+        items = []
+        for r in rows:
+            body = json.loads(r['body'])
+            ttl = float(body.get('ttl_seconds') or 120.0)
+            online = bool(body.get('online_reported', True)) and (now - r['seen']) < ttl and (now - r['updated']) < max(ttl, 300.0)
+            items.append({**body, 'domain': r['domain'], 'id': r['id'], 'last_seen': r['seen'], 'updated': r['updated'], 'online': online, 'paused': bool(r['paused']), 'sequence': r['sequence']})
+        return items
+
+    def external_tasks(self, limit=50, offset=0, status=None, kind=None, domain=None):
+        """Return paginated mirrored tasks filtered by status, kind, or domain."""
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        clauses, params = [], []
+        if status:
+            if status not in EXTERNAL_STATUSES:
+                raise ValueError('invalid_external_status')
+            clauses.append('status=?')
+            params.append(status)
+        if kind:
+            if kind not in EXTERNAL_KINDS:
+                raise ValueError('invalid_external_kind')
+            clauses.append('kind=?')
+            params.append(kind)
+        if domain:
+            if domain not in EXTERNAL_DOMAINS:
+                raise ValueError('invalid_external_domain')
+            clauses.append('domain=?')
+            params.append(domain)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+        with self.tx() as db:
+            total = db.execute(f'SELECT COUNT(*) FROM external_tasks {where}', params).fetchone()[0]
+            rows = db.execute(f'SELECT * FROM external_tasks {where} ORDER BY updated DESC, created DESC LIMIT ? OFFSET ?', [*params, limit, offset]).fetchall()
+        items = [dict(json.loads(r['body']), domain=r['domain'], identity=r['identity'], kind=r['kind'], status=r['status'], created=r['created'], updated=r['updated']) for r in rows]
+        return {'items': items, 'total': total, 'has_more': offset + limit < total}
+
+    def external_task_detail(self, domain, identity):
+        """Return full sanitized metadata for one mirrored external task."""
+        with self.tx() as db:
+            row = db.execute('SELECT * FROM external_tasks WHERE domain=? AND identity=?', (domain, identity)).fetchone()
+        if not row:
+            raise KeyError(identity)
+        return dict(json.loads(row['body']), domain=row['domain'], identity=row['identity'], kind=row['kind'], status=row['status'], created=row['created'], updated=row['updated'])

@@ -33,7 +33,10 @@ token from private server config. Never mirror credentials.
 | GET `/tasks/{id}/activation-preview` | Current active attempt for compare-and-swap activation. |
 | POST `/tasks/{id}/activate` | expected_active_attempt (null/legacy/attempt ID). Replay-safe activation from staging or `staged_candidate`; converts previous serving pin to `rollback_previous`. |
 | POST `/retention/sweep` | Disabled-by-default candidate retention sweep and crash recovery for `quarantined` attempts. |
-| GET `/workers` | Sanitized workers/snapshots; last seen and last progress separately. |
+| GET `/workers` | Sanitized video workers (`items`) and mirrored coaching/export workers (`external`); last seen and last progress separately. |
+| POST `/external-sync` | Same-origin / `X-Tennis-Request` sanitized snapshot or delta sync (`domain`: `coaching`/`exports`, `workers[]`, `tasks[]`, `deleted[]`, `snapshot`, `complete`). Stores only sanitized status/error summaries (no prompts, answers, credentials, or host paths). |
+| GET `/external-tasks` | Filtered/paginated mirrored external tasks (`kind`: `ai_coach`/`learning_plan`/`clip_interval_export`/`coaching_excerpt_render`, `status`, `domain`, `limit<=200`, `offset`) plus `workers[]`. |
+| GET `/external-tasks/{domain}/{identity}` | Full sanitized metadata and error diagnostics for a single mirrored external task. |
 | PATCH `/workers/{id}` | paused, expected_version; pause affects future assignments. |
 | GET/POST `/watchers` | storage_id=originals, relative path, enabled (default false), settle_seconds, parameters. |
 | PATCH `/watchers/{id}` | expected_version, enabled/settle_seconds/parameters. |

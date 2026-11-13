@@ -305,7 +305,34 @@ def create_app(config=None):
         body()
         return jsonify(files.run_retention(store))
     @app.get('/api/v1/workers')
-    def workers(): return jsonify(items=store.workers())
+    def workers(): return jsonify(items=store.workers(), external=store.external_workers())
+    @app.post('/api/v1/external-sync')
+    def external_sync():
+        b=body()
+        return jsonify(store.sync_external(
+            b.get('domain'),
+            workers=b.get('workers'),
+            tasks=b.get('tasks'),
+            deleted=b.get('deleted'),
+            snapshot=bool(b.get('snapshot',False)),
+            complete=bool(b.get('complete',True)),
+        ))
+    @app.get('/api/v1/external-tasks')
+    def external_tasks():
+        limit=request.args.get('limit',default=50,type=int)
+        offset=request.args.get('offset',default=0,type=int)
+        res=store.external_tasks(
+            limit=50 if limit is None else limit,
+            offset=0 if offset is None else offset,
+            status=request.args.get('status') or None,
+            kind=request.args.get('kind') or None,
+            domain=request.args.get('domain') or None,
+        )
+        res['workers']=store.external_workers()
+        return jsonify(res)
+    @app.get('/api/v1/external-tasks/<domain>/<path:identity>')
+    def external_task_detail(domain,identity):
+        return jsonify(store.external_task_detail(domain,identity))
     @app.patch('/api/v1/workers/<identity>')
     def pause(identity):
         # This route is an admin action even though its prefix is worker-facing.

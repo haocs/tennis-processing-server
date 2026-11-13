@@ -2,8 +2,11 @@
 
 LAN-hosted processing orchestration for [tennis-processing](https://github.com/haocs/tennis-processing).
 One Docker application provides the API, persistent task/attempt history, worker
-leases, an input scanner, publication control and a responsive control portal.
-The [viewing website](https://github.com/haocs/tennis-web) remains separate.
+leases, an input scanner, publication control and the low-level **Worker Portal**
+UI (showing video tasks alongside mirrored AI coaching, learning plan, and clip
+interval export tasks pushed from [tennis-web](https://github.com/haocs/tennis-web)).
+The user-facing [viewing website](https://github.com/haocs/tennis-web) and its
+high-level Processing Room remain separate.
 
 ## Storage and deployment
 
@@ -97,3 +100,7 @@ The scheduler mirrors a small compatibility status JSON/text into library metada
 for the existing viewing site's processing indicator. Worker offline/stale state
 is separate from server liveness. Image publication also runs on version-tag pushes,
 so releases can be performed with Git/API tooling without browser operations.
+
+## TODO
+
+- **Worker failure error logging**: Extend video, render, and AI coaching workers to consistently emit structured, secret- and path-redacted failure details (`error_code`, concise `error`, and bounded `error_detail`) when tasks fail so the Worker Portal logs and displays exact failure reasons without exposing prompts, answers, tokens, or local host paths.

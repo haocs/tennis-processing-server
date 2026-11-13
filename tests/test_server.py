@@ -769,3 +769,173 @@ def test_boundary_override_cannot_erase_an_unrelated_base_clip():
         with pytest.raises(InvalidFeedback,match='override_crosses_base_clip'):validate_snapshot(p,base)
     p['confirmed_commands']['override_clip_bounds_ms'][0].update(original_start_ms=1200,original_end_ms=4500)
     assert validate_snapshot(p,base)['confirmed_commands']['override_clip_bounds_ms'][0]['original_end_ms']==4500
+
+
+def test_worker_portal_html_and_external_task_sync(env):
+    app,c,h,s,cfg=env
+    html=c.get('/').text
+    assert 'Worker portal' in html
+    assert 'COURTSIDE <span>PORTAL</span>' in html
+    assert 'kind-filter' in html
+    assert 'processing room' not in html.lower()
+
+    assert c.post('/api/v1/external-sync',json={'domain':'coaching','workers':[],'tasks':[]}).status_code==403
+    assert c.post('/api/v1/external-sync',json={'domain':'invalid','workers':[],'tasks':[]},headers=h).status_code==400
+    assert c.post('/api/v1/external-sync',json={'domain':'coaching','tasks':[{'identity':'bad-1','kind':'unknown','status':'queued'}]},headers=h).status_code==400
+
+    store=app.config['STORE']
+    now=store.clock()
+    payload={
+        'domain':'coaching',
+        'snapshot':True,
+        'complete':True,
+        'workers':[
+            {'id':'ai-1','role':'ai','label':'AI coach','last_seen':now,'online':True,'provider':'chatgpt','default_model':'chatgpt','status_text':'Ready'},
+            {'id':'render-1','role':'render','label':'Media export','last_seen':now,'online':True,'capabilities':['clip-interval-export'],'status_text':'Idle'},
+        ],
+        'tasks':[
+            {
+                'identity':'coach:1',
+                'kind':'ai_coach',
+                'status':'failed',
+                'raw_status':'error',
+                'title':'AI coach · Backhand check',
+                'summary':'Rally #4 · Failed',
+                'worker_id':'ai-1',
+                'worker_role':'ai',
+                'session_id':'sess-1',
+                'session_name':'Evening Hits',
+                'provider':'chatgpt',
+                'model':'chatgpt',
+                'attempts':2,
+                'error':'Provider timed out after 30s',
+                'error_code':'provider_timeout',
+                'error_detail':'upstream provider request timed out',
+                'prompt':'private user prompt must be stripped',
+                'answer':'private answer must be stripped',
+                'created':now-30,
+                'updated':now-5,
+            },
+            {
+                'identity':'plan:1',
+                'kind':'learning_plan',
+                'status':'running',
+                'title':'Learning plan · Serve prep',
+                'worker_id':'ai-1',
+                'worker_role':'ai',
+                'provider':'gemini',
+                'created':now-20,
+                'updated':now-2,
+            },
+            {
+                'identity':'export:1',
+                'kind':'clip_interval_export',
+                'status':'succeeded',
+                'title':'Clip interval · 0:12–0:24',
+                'summary':'HDR 1080p export ready',
+                'worker_id':'render-1',
+                'worker_role':'render',
+                'session_id':'sess-1',
+                'session_name':'Evening Hits',
+                'created':now-40,
+                'updated':now-10,
+            },
+            {
+                'identity':'excerpt:1',
+                'kind':'coaching_excerpt_render',
+                'status':'queued',
+                'title':'Coaching render · Rally #4',
+                'worker_role':'render',
+                'session_id':'sess-1',
+                'created':now-15,
+                'updated':now-15,
+            },
+        ],
+    }
+    res=c.post('/api/v1/external-sync',json=payload,headers=h)
+    assert res.status_code==200,res.data
+    assert res.json=={'domain':'coaching','workers':2,'tasks':4,'deleted':0}
+
+    ext=c.get('/api/v1/external-tasks').json
+    assert ext['total']==4 and len(ext['workers'])==2
+    assert c.get('/api/v1/workers').json['items']==[]
+    assert len(c.get('/api/v1/workers').json['external'])==2
+
+    coach=c.get('/api/v1/external-tasks?kind=ai_coach&status=failed').json
+    assert coach['total']==1
+    item=coach['items'][0]
+    assert item['error']=='Provider timed out after 30s'
+    assert 'prompt' not in item and 'answer' not in item
+
+    detail=c.get('/api/v1/external-tasks/coaching/coach:1').json
+    assert detail['error_code']=='provider_timeout'
+    assert 'prompt' not in detail
+
+    clip=c.get('/api/v1/external-tasks?kind=clip_interval_export').json
+    assert clip['total']==1 and clip['items'][0]['title']=='Clip interval · 0:12–0:24'
+
+    # Complete snapshot replaces removed tasks cleanly.
+    res2=c.post('/api/v1/external-sync',json={'domain':'coaching','snapshot':True,'complete':True,'workers':payload['workers'][:1],'tasks':payload['tasks'][:2]},headers=h)
+    assert res2.status_code==200
+    assert c.get('/api/v1/external-tasks').json['total']==2
+    assert len(c.get('/api/v1/external-tasks').json['workers'])==1
+
+
+def test_worker_portal_ui_browser(env):
+    playwright=pytest.importorskip('playwright.sync_api')
+    import threading
+    from werkzeug.serving import make_server
+
+    app,c,h,s,cfg=env
+    w,_wh=worker(c)
+    t_vid=task(c,h,s,'dryrun','ui-vid')
+    now=app.config['STORE'].clock()
+    assert c.post('/api/v1/external-sync',json={
+        'domain':'coaching',
+        'snapshot':True,
+        'complete':True,
+        'workers':[
+            {'id':'ai-ui','role':'ai','label':'AI coach','last_seen':now,'online':True,'provider':'chatgpt','default_model':'chatgpt','status_text':'Ready'},
+            {'id':'render-ui','role':'render','label':'Media export','last_seen':now,'online':True,'status_text':'Idle'},
+        ],
+        'tasks':[
+            {'identity':'coach:ui','kind':'ai_coach','status':'failed','title':'AI coach · Forehand ask','session_name':'Morning Session','provider':'chatgpt','error':'Provider gateway returned 502','error_code':'bad_gateway','error_detail':'502 Bad Gateway from relay','created':now-10,'updated':now-1},
+            {'identity':'export:ui','kind':'clip_interval_export','status':'succeeded','title':'Clip interval · 0:08–0:20','session_name':'Morning Session','created':now-20,'updated':now-5},
+        ],
+    },headers=h).status_code==200
+
+    server=make_server('127.0.0.1',0,app,threaded=True)
+    port=server.server_port
+    thread=threading.Thread(target=server.serve_forever,daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser=p.chromium.launch()
+            for width,height in ((1280,800),(390,844)):
+                page=browser.new_page(viewport={'width':width,'height':height})
+                page.goto(f'http://127.0.0.1:{port}/',wait_until='networkidle')
+                page.wait_for_selector('#tasks .task')
+                body_text=page.inner_text('body')
+                assert 'Worker portal' in body_text
+                assert 'processing room' not in body_text.lower()
+                assert 'AI coach' in page.inner_text('#workers')
+                assert 'Media export' in page.inner_text('#workers')
+                assert 'Provider gateway returned 502' in page.inner_text('#tasks')
+                assert 'Clip interval · 0:08–0:20' in page.inner_text('#tasks')
+                assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+                page.select_option('#kind-filter','clip_interval_export')
+                assert 'Clip interval · 0:08–0:20' in page.inner_text('#tasks')
+                assert 'AI coach · Forehand ask' not in page.inner_text('#tasks')
+                page.select_option('#kind-filter','')
+                page.click('button[data-ext-detail="coaching/coach%3Aui"]')
+                page.wait_for_selector('#detail[open]')
+                modal_text=page.inner_text('#detail')
+                assert 'Worker error' in modal_text
+                assert 'Provider gateway returned 502' in modal_text
+                assert '502 Bad Gateway from relay' in modal_text
+                page.click('#detail button[data-close]')
+                page.close()
+            browser.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
