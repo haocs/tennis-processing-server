@@ -969,9 +969,23 @@ def test_worker_portal_ui_browser(env):
                 assert 'processing room' not in body_text.lower()
                 workers_text=page.inner_text('#workers')
                 assert 'Vision + Hybrid AI · 2 models · Default: gemini-4-hydrogen-low' in workers_text
-                assert page.locator('#workers select').count()==0
+                assert page.locator('#coaching-default-model').count()==1
                 assert 'AI coach' in workers_text
                 assert 'Media export' in workers_text
+                assert page.locator('#cleanup-workers').is_visible()
+                assert page.locator(f'button[data-cleanup-worker="{w}"]').is_visible()
+                if width==1280:
+                    page.locator('#coaching-default-model').focus()
+                    kept_el=page.evaluate('() => { window.__keptCoachSel = document.querySelector("#coaching-default-model"); return true; }')
+                    assert kept_el
+                    page.evaluate('() => refresh()')
+                    page.wait_for_timeout(100)
+                    assert page.evaluate('() => document.querySelector("#coaching-default-model") === window.__keptCoachSel')
+                    page.select_option('#coaching-default-model','gemini:gemini-2.5-flash')
+                    page.wait_for_function("() => document.querySelector('#notice').innerText.includes('Default AI model')")
+                    assert page.locator('#coaching-default-model').input_value()=='gemini:gemini-2.5-flash'
+                    page.click(f'button[data-cleanup-worker="{w}"]')
+                    page.wait_for_function("() => document.querySelector('#workers').innerText.includes('Cleanup queued')")
                 assert 'hybrid · gemini-2.5-flash · fallback' in page.inner_text('#tasks')
                 assert 'Provider gateway returned 502' in page.inner_text('#tasks')
                 assert 'Clip interval · 0:08–0:20' in page.inner_text('#tasks')
@@ -1217,3 +1231,136 @@ def test_watcher_hybrid_ai_validation_and_cut_constraints_ban(env):
     hybrid_tasks=[t for t in tasks if t.get('trigger')=='watcher' and t.get('parameters',{}).get('processing_strategy')=='hybrid_ai_vision']
     assert len(hybrid_tasks)==1
     assert 'hybrid-ai-vision-v1' in hybrid_tasks[0]['required_capabilities']
+
+
+def test_worker_cleanup_requests_and_heartbeat_reporting(env):
+    app,c,h,s,cfg=env
+    reg=c.post('/api/v1/workers/register',json={
+        'display_name':'Cleaner','platform':'mac','worker_version':'2.2.0',
+        'capabilities':['process-v2'],'accessible_storage_ids':['originals','processing'],
+    },headers={'Authorization':'Bearer test-secret'}).json
+    wid,wh=reg['worker_id'],{'Authorization':'Bearer '+reg['worker_token'],'X-Worker-ID':reg['worker_id']}
+
+    hb1=c.post(f'/api/v1/workers/{wid}/heartbeat',json={
+        'sequence':1,'stage':'Idle','last_progress_at':0,
+        'scratch':{'tasks_bytes':4096,'cleanable_bytes':3072,'task_count':2,'cleanable_count':1,'cache_bytes':512},
+    },headers=wh)
+    assert hb1.status_code==200
+    assert hb1.json['cleanup_requested_sequence']==0
+    assert c.post('/api/v1/workers/cleanup',json={}).status_code==403
+
+    req_one=c.post(f'/api/v1/workers/{wid}/cleanup',json={},headers=h)
+    assert req_one.status_code==200
+    assert req_one.json['cleanup_requested_sequence']==1
+    # Requesting cleanup must NOT bump worker sequence (so sequence=2 is accepted).
+    workers_list=c.get('/api/v1/workers').json['items']
+    assert workers_list[0]['version']==1
+    assert workers_list[0]['cleanup_requested_sequence']==1
+    assert workers_list[0]['scratch']['cleanable_bytes']==3072
+
+    hb2=c.post(f'/api/v1/workers/{wid}/heartbeat',json={
+        'sequence':2,'stage':'Idle','last_progress_at':0,
+        'scratch':{'tasks_bytes':1024,'cleanable_bytes':0,'task_count':1,'cleanable_count':0,'cache_bytes':512},
+        'last_cleanup':{'sequence':1,'completed_at':1700000010,'removed_tasks':1,'freed_bytes':3072,'errors':0},
+    },headers=wh)
+    assert hb2.status_code==200
+    assert hb2.json['cleanup_requested_sequence']==1
+    worker_after=c.get('/api/v1/workers').json['items'][0]
+    assert worker_after['last_cleanup']['removed_tasks']==1
+    assert worker_after['scratch']['cleanable_bytes']==0
+
+    req_all=c.post('/api/v1/workers/cleanup',json={},headers=h)
+    assert req_all.status_code==200 and req_all.json['workers']==[{'id':wid,'cleanup_requested_sequence':2}]
+    assert c.post('/api/v1/workers/missing-worker/cleanup',json={},headers=h).status_code==404
+
+
+def test_coaching_ai_config_forwarding_and_sync_fallback(tmp_path):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from app import create_app
+
+    received=[]
+    mock_state={'selection':'worker_default','provider':None,'model':None,'version':2}
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self,*args): pass
+        def do_GET(self):
+            if self.path=='/api/coaching/config':
+                body=json.dumps(mock_state).encode('utf-8')
+                self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+        def do_PUT(self):
+            length=int(self.headers.get('Content-Length','0'))
+            data=json.loads(self.rfile.read(length).decode('utf-8'))
+            received.append({'path':self.path,'headers':dict(self.headers),'body':data})
+            if self.headers.get('X-Tennis-Request')!='1':
+                self.send_response(415);self.end_headers();return
+            if data.get('version')!=mock_state['version']:
+                body=json.dumps({'error':'conflict','current':mock_state}).encode('utf-8')
+                self.send_response(409);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body);return
+            mock_state['version']+=1
+            mock_state['selection']=data['selection']
+            mock_state['provider'],_,mock_state['model']=data['selection'].partition(':') if ':' in data['selection'] else (data['selection'] if data['selection']!='worker_default' else None,'',None)
+            body=json.dumps(mock_state).encode('utf-8')
+            self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+
+    srv=HTTPServer(('127.0.0.1',0),Handler)
+    t=threading.Thread(target=srv.serve_forever,daemon=True);t.start()
+    try:
+        storage={}
+        for name in ('originals','processing','library'):
+            p=tmp_path/name;p.mkdir()
+            if name!='originals':
+                (p/'.tennis-storage-id').write_text(name+'-id')
+                storage[name]={'path':str(p),'identity':name+'-id'}
+            else:
+                storage[name]={'path':str(p)}
+        app=create_app({'data_dir':str(tmp_path/'data'),'registration_token':'sec','storage':storage,'website_api_url':f'http://127.0.0.1:{srv.server_port}'})
+        c=app.test_client()
+        h={'X-Tennis-Request':'1'}
+
+        # GET pulls live website config when website_api_url is configured
+        cfg=c.get('/api/v1/coaching/ai-config').json
+        assert cfg['selection']=='worker_default' and cfg['version']==2 and cfg['pending_sync'] is False
+
+        # PUT forwards with X-Tennis-Request=1 and version=2
+        put_ok=c.put('/api/v1/coaching/ai-config',json={'selection':'gemini:gemini-2.5-flash','version':2},headers=h)
+        assert put_ok.status_code==200,put_ok.data
+        assert put_ok.json['selection']=='gemini:gemini-2.5-flash' and put_ok.json['version']==3 and put_ok.json['pending_sync'] is False
+        assert received[-1]['body']=={'selection':'gemini:gemini-2.5-flash','version':2}
+
+        # Version conflict returns 409 and refreshes local cached config
+        mock_state['version']=5
+        mock_state['selection']='codex'
+        conflict=c.put('/api/v1/coaching/ai-config',json={'selection':'antigravity','version':3},headers=h)
+        assert conflict.status_code==409 and conflict.json['current']['selection']=='codex'
+    finally:
+        srv.shutdown();t.join(timeout=2)
+
+    # Without website_api_url (or when unreachable), PUT records pending_sync and converges via external-sync
+    put_fb=c.put('/api/v1/coaching/ai-config',json={'selection':'gemini:gemini-2.5-pro'},headers=h)
+    assert put_fb.status_code==200
+    assert put_fb.json['selection']=='gemini:gemini-2.5-pro' and put_fb.json['pending_sync'] is True
+    # Stale snapshot from web gets desired_ai_config back without overwriting selection
+    sync1=c.post('/api/v1/external-sync',json={'domain':'coaching','workers':[],'tasks':[],'settings':{'ai_config':{'selection':'codex','version':5}}},headers=h).json
+    assert sync1['desired_ai_config']['selection']=='gemini:gemini-2.5-pro'
+    # Converged snapshot clears pending_sync
+    sync2=c.post('/api/v1/external-sync',json={'domain':'coaching','workers':[],'tasks':[],'settings':{'ai_config':{'selection':'gemini:gemini-2.5-pro','version':6}}},headers=h).json
+    assert 'desired_ai_config' not in sync2
+    assert c.get('/api/v1/coaching/ai-config').json['pending_sync'] is False
+
+
+def test_staged_candidates_summary_lifecycle(env):
+    app,c,h,s,cfg=env
+    assert c.get('/api/v1/videos/staged-summary').json=={'by_source':{}}
+    t_id=c.post('/api/v1/tasks',json={'source_id':s,'type':'process'},headers=dict(h,**{'Idempotency-Key':'staged-sum-1'})).json['task_id']
+    reg=c.post('/api/v1/workers/register',json={'display_name':'W','platform':'mac','worker_version':'2.2.0','capabilities':['process-v2'],'accessible_storage_ids':['originals','processing']},headers={'Authorization':'Bearer test-secret'}).json
+    wa,wha=reg['worker_id'],{'Authorization':'Bearer '+reg['worker_token'],'X-Worker-ID':reg['worker_id']}
+    att=claim(c,wa,wha)['attempt']
+    digest=hashlib.sha256(b'input').hexdigest()
+    _write_process_attempt_bundle(cfg,t_id,att['id'],digest)
+    assert c.post('/api/v1/attempts/'+att['id']+'/complete',json={'task_id':t_id,'lease_token':att['lease_token'],'final_event_sequence':0,'source_sha256':digest,'result_ref':{'storage_id':'processing','path':f'runs/{t_id}/{att["id"]}/result.json'}},headers=dict(wha,**{'Idempotency-Key':'staged-done-1'})).status_code==200
+    assert c.post('/api/v1/tasks/'+t_id+'/stage-candidate',json={},headers=h).status_code==200
+    summary=c.get('/api/v1/videos/staged-summary').json
+    assert summary['by_source'][digest]['count']==1
+    assert summary['by_source'][digest]['latest_attempt_id']==att['id']
+    assert c.post('/api/v1/tasks/'+t_id+'/activate',json={'expected_active_attempt':None},headers=h).status_code==200
+    assert c.get('/api/v1/videos/staged-summary').json=={'by_source':{}}

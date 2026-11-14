@@ -5,11 +5,13 @@ import os
 from pathlib import Path
 import secrets
 import time
+import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
 from flask import Flask, jsonify, request, render_template, Response
 from files import Files, atomic, inside
 from feedback import InvalidFeedback
-from store import Store, Conflict, encode, uid
+from store import Store, Conflict, encode, parse_coaching_ai_selection, uid
 
 
 def create_app(config=None):
@@ -292,12 +294,86 @@ def create_app(config=None):
     @app.post('/api/v1/tasks/<identity>/activate')
     def activate(identity):
         b=body();return jsonify(files.activate(store,identity,b.get('expected_active_attempt')))
+    def _website_api_url():
+        raw=(config.get('website_api_url') or os.environ.get('PROCESSING_WEBSITE_API_URL') or '').strip().rstrip('/')
+        if not raw or urlsplit(raw).scheme not in ('http','https'):
+            return ''
+        return raw
+
+    def _website_call(path, method='GET', payload=None):
+        base=_website_api_url()
+        if not base:
+            return None, None
+        data=json.dumps(payload).encode('utf-8') if payload is not None else None
+        headers={'Accept':'application/json'}
+        if payload is not None:
+            headers['Content-Type']='application/json'
+            headers['X-Tennis-Request']='1'
+        req=urllib.request.Request(base+path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                raw=resp.read()
+                parsed=json.loads(raw.decode('utf-8')) if raw else {}
+                return resp.status, parsed
+        except urllib.error.HTTPError as exc:
+            try:
+                raw=exc.read()
+                parsed=json.loads(raw.decode('utf-8')) if raw else {}
+            except Exception:
+                parsed={}
+            return exc.code, parsed
+        except Exception:
+            return None, None
+
     @app.post('/api/v1/retention/sweep')
     def retention_sweep():
         body()
         return jsonify(files.run_retention(store))
     @app.get('/api/v1/workers')
-    def workers(): return jsonify(items=store.workers(), external=store.external_workers(), available_ai_models=store.available_ai_models())
+    def workers(): return jsonify(items=store.workers(), external=store.external_workers(), available_ai_models=store.available_ai_models(), coaching_ai_config=store.coaching_ai_config())
+    @app.post('/api/v1/workers/cleanup')
+    def cleanup_all_workers():
+        body()
+        return jsonify(store.request_worker_cleanup())
+    @app.post('/api/v1/workers/<identity>/cleanup')
+    def cleanup_worker(identity):
+        body()
+        return jsonify(store.request_worker_cleanup(identity))
+    @app.get('/api/v1/videos/staged-summary')
+    def staged_summary():
+        return jsonify(files.staged_candidates_summary(store))
+    @app.get('/api/v1/coaching/ai-config')
+    def get_coaching_ai_config():
+        cfg=store.coaching_ai_config()
+        if not cfg.get('pending_sync'):
+            code, remote=_website_call('/api/coaching/config', method='GET')
+            if code==200 and isinstance(remote, dict) and isinstance(remote.get('selection'), str):
+                cfg=store.update_coaching_ai_config(remote['selection'], forwarded_result=remote)
+        return jsonify(cfg)
+    @app.put('/api/v1/coaching/ai-config')
+    def put_coaching_ai_config():
+        b=body()
+        norm_sel, _, _=parse_coaching_ai_selection(b.get('selection'))
+        raw_ver=b.get('version')
+        if raw_ver is not None and (isinstance(raw_ver, bool) or not isinstance(raw_ver, int) or raw_ver<0):
+            raise ValueError('invalid_ai_config_version')
+        if _website_api_url():
+            ver=raw_ver
+            if ver is None:
+                code, remote=_website_call('/api/coaching/config', method='GET')
+                if code==200 and isinstance(remote, dict) and isinstance(remote.get('version'), int):
+                    ver=remote['version']
+                else:
+                    ver=store.coaching_ai_config()['version']
+            code, remote=_website_call('/api/coaching/config', method='PUT', payload={'selection':norm_sel, 'version':int(ver)})
+            if code==200 and isinstance(remote, dict) and isinstance(remote.get('selection'), str):
+                return jsonify(store.update_coaching_ai_config(norm_sel, forwarded_result=remote))
+            if code==409:
+                cur_remote=remote.get('current') if isinstance(remote, dict) else None
+                if isinstance(cur_remote, dict) and isinstance(cur_remote.get('selection'), str):
+                    store.update_coaching_ai_config(cur_remote['selection'], forwarded_result=cur_remote)
+                return jsonify(error={'code':'ai_config_version_conflict','retryable':True}, current=store.coaching_ai_config()), 409
+        return jsonify(store.update_coaching_ai_config(norm_sel, expected_version=raw_ver))
     @app.post('/api/v1/external-sync')
     def external_sync():
         b=body()
@@ -308,6 +384,7 @@ def create_app(config=None):
             deleted=b.get('deleted'),
             snapshot=bool(b.get('snapshot',False)),
             complete=bool(b.get('complete',True)),
+            settings=b.get('settings'),
         ))
     @app.get('/api/v1/external-tasks')
     def external_tasks():

@@ -155,3 +155,18 @@ def test_real_worker_hybrid_ai_vision_and_fallback(env,monkeypatch,tmp_path):
     },headers=dict(headers,**{'Idempotency-Key':'hybrid-int-pin'})).json['task_id']
     assert pinned_task
     assert agent.api.call('/workers/'+agent.state['worker_id']+'/claims',{'request_id':'hybrid-claim-pin'}) is None
+
+    # End-to-end worker scratch cleanup removes processed task folder and reports confirmation via heartbeat while preserving cache.
+    worker_tasks_dir=tmp_path/'worker'/'tasks'/task
+    worker_cache_file=tmp_path/'worker'/'cache'/'pose-test.json'
+    worker_cache_file.parent.mkdir(parents=True,exist_ok=True)
+    worker_cache_file.write_text('{"cached":true}')
+    assert worker_tasks_dir.is_dir()
+    assert client.post('/api/v1/workers/'+agent.state['worker_id']+'/cleanup',json={},headers=headers).status_code==200
+    agent.heartbeat()
+    assert not worker_tasks_dir.exists()
+    assert worker_cache_file.is_file()
+    worker_info=next(w for w in client.get('/api/v1/workers').json['items'] if w['id']==agent.state['worker_id'])
+    assert worker_info['last_cleanup']['removed_tasks']>=1
+    assert worker_info['scratch']['cleanable_count']==0
+    assert worker_info['scratch']['cleanable_bytes']==0

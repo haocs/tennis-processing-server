@@ -434,6 +434,46 @@ class Files:
             items.sort(key=lambda x:(1 if x['is_active'] else 0,float(x['published_at'] or 0.0)),reverse=True)
             return items
 
+    def staged_candidates_summary(self, store):
+        """Return per-source summary of staged (non-active) candidate versions."""
+        lib=self.root('library')
+        by_source={}
+        with store.tx() as db:
+            pubs={r['source_hash']:r['attempt_id'] for r in db.execute('SELECT source_hash, attempt_id FROM publications').fetchall()}
+            rows=db.execute(
+                "SELECT a.id AS attempt_id, a.task_id, a.body AS attempt_body, t.result AS task_result, t.created AS task_created, s.body AS source_body "
+                "FROM attempts a JOIN tasks t ON t.id=a.task_id LEFT JOIN sources s ON s.id=t.source_id "
+                "WHERE a.media_state='staged_candidate' ORDER BY a.rowid DESC"
+            ).fetchall()
+        for row in rows:
+            res_data=json.loads(row['task_result']) if row['task_result'] else {}
+            src_data=json.loads(row['source_body']) if row['source_body'] else {}
+            digest=res_data.get('source_sha256') or src_data.get('sha256')
+            if not isinstance(digest,str) or not digest:
+                continue
+            if pubs.get(digest)==row['attempt_id']:
+                continue
+            cand_path=lib/'metadata/candidates'/digest/f"{row['attempt_id']}.json"
+            if not cand_path.is_file():
+                continue
+            att_body=json.loads(row['attempt_body']) if row['attempt_body'] else {}
+            staged_at=float(att_body.get('staged_at') if att_body.get('staged_at') is not None else (att_body.get('finished_at') or row['task_created'] or 0.0))
+            entry=by_source.get(digest)
+            if entry is None:
+                by_source[digest]={
+                    'count':1,
+                    'latest_attempt_id':row['attempt_id'],
+                    'latest_task_id':row['task_id'],
+                    'latest_staged_at':staged_at,
+                }
+            else:
+                entry['count']+=1
+                if staged_at>entry['latest_staged_at']:
+                    entry['latest_staged_at']=staged_at
+                    entry['latest_attempt_id']=row['attempt_id']
+                    entry['latest_task_id']=row['task_id']
+        return {'by_source':by_source}
+
     def get_attempt_heuristics(self, store, attempt_id):
         with store.tx() as db:
             att_row=db.execute('SELECT * FROM attempts WHERE id=?',(attempt_id,)).fetchone()

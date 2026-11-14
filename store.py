@@ -147,6 +147,106 @@ def _validate_worker_ai_fields(public, body):
         public['default_ai_model'] = next((m['id'] for m in public.get('ai_models') or [] if m.get('is_default')), None)
 
 
+COACHING_VALID_PROVIDERS = ('codex', 'antigravity', 'gemini')
+COACHING_PROVIDER_GROUPS = {
+    'antigravity': 'Antigravity',
+    'codex': 'ChatGPT (Codex)',
+    'gemini': 'Gemini API',
+}
+COACHING_AI_PRESETS = (
+    {'selection': 'worker_default', 'label': 'Worker config default', 'provider': None, 'model': None, 'group': 'Default'},
+    {'selection': 'antigravity', 'label': 'Antigravity · Account default', 'provider': 'antigravity', 'model': None, 'group': 'Antigravity'},
+    {'selection': 'antigravity:gemini-4-carbon-high', 'label': 'Antigravity · Gemini 4 Carbon (High)', 'provider': 'antigravity', 'model': 'gemini-4-carbon-high', 'group': 'Antigravity'},
+    {'selection': 'antigravity:gemini-4-carbon-medium', 'label': 'Antigravity · Gemini 4 Carbon (Medium)', 'provider': 'antigravity', 'model': 'gemini-4-carbon-medium', 'group': 'Antigravity'},
+    {'selection': 'antigravity:gemini-3.8-flash-high', 'label': 'Antigravity · Gemini 3.8 Flash (High)', 'provider': 'antigravity', 'model': 'gemini-3.8-flash-high', 'group': 'Antigravity'},
+    {'selection': 'antigravity:claude-sonnet-4-6', 'label': 'Antigravity · Claude Sonnet 4.6', 'provider': 'antigravity', 'model': 'claude-sonnet-4-6', 'group': 'Antigravity'},
+    {'selection': 'codex', 'label': 'ChatGPT (Codex) · Account default', 'provider': 'codex', 'model': None, 'group': 'ChatGPT (Codex)'},
+    {'selection': 'codex:gpt-5-codex', 'label': 'ChatGPT (Codex) · GPT-5 Codex', 'provider': 'codex', 'model': 'gpt-5-codex', 'group': 'ChatGPT (Codex)'},
+    {'selection': 'gemini:gemini-2.5-flash', 'label': 'Gemini API · Gemini 2.5 Flash', 'provider': 'gemini', 'model': 'gemini-2.5-flash', 'group': 'Gemini API'},
+    {'selection': 'gemini:gemini-2.5-pro', 'label': 'Gemini API · Gemini 2.5 Pro', 'provider': 'gemini', 'model': 'gemini-2.5-pro', 'group': 'Gemini API'},
+)
+
+
+def parse_coaching_ai_selection(selection):
+    """Validate and normalize a coaching default AI provider/model selection string."""
+    if not isinstance(selection, str):
+        raise ValueError('Invalid default AI model selection')
+    cleaned = selection.strip()
+    if cleaned == 'worker_default':
+        return ('worker_default', None, None)
+    if cleaned in COACHING_VALID_PROVIDERS:
+        return (cleaned, cleaned, None)
+    if ':' in cleaned:
+        provider, model = cleaned.split(':', 1)
+        if provider in COACHING_VALID_PROVIDERS and re.fullmatch(r'[A-Za-z0-9._-]{1,64}', model):
+            return (f'{provider}:{model}', provider, model)
+    raise ValueError('Invalid default AI model selection')
+
+
+def _nonneg_int(value, code):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(code)
+    return int(value)
+
+
+def _sanitize_worker_scratch(raw):
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError('invalid_worker_scratch')
+    return {
+        'tasks_bytes': _nonneg_int(raw.get('tasks_bytes', 0), 'invalid_worker_scratch'),
+        'cleanable_bytes': _nonneg_int(raw.get('cleanable_bytes', 0), 'invalid_worker_scratch'),
+        'task_count': _nonneg_int(raw.get('task_count', 0), 'invalid_worker_scratch'),
+        'cleanable_count': _nonneg_int(raw.get('cleanable_count', 0), 'invalid_worker_scratch'),
+        'cache_bytes': _nonneg_int(raw.get('cache_bytes', 0), 'invalid_worker_scratch'),
+    }
+
+
+def _sanitize_worker_cleanup(raw):
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError('invalid_worker_cleanup')
+    return {
+        'sequence': _nonneg_int(raw.get('sequence', 0), 'invalid_worker_cleanup'),
+        'completed_at': _opt_float(raw.get('completed_at')),
+        'removed_tasks': _nonneg_int(raw.get('removed_tasks', 0), 'invalid_worker_cleanup'),
+        'freed_bytes': _nonneg_int(raw.get('freed_bytes', 0), 'invalid_worker_cleanup'),
+        'errors': _nonneg_int(raw.get('errors', 0), 'invalid_worker_cleanup'),
+    }
+
+
+def _sanitize_coaching_models(raw):
+    if not isinstance(raw, list):
+        return []
+    out, seen = [], set()
+    for item in raw[:32]:
+        if isinstance(item, str):
+            sel_raw, label, group = item, None, None
+        elif isinstance(item, dict):
+            sel_raw = item.get('selection') or item.get('id')
+            if not sel_raw and item.get('provider') and item.get('model'):
+                sel_raw = f"{item['provider']}:{item['model']}"
+            label = _short_text(item.get('label'), 120)
+            group = _short_text(item.get('group'), 64)
+        else:
+            continue
+        try:
+            sel, provider, model = parse_coaching_ai_selection(sel_raw)
+        except ValueError:
+            continue
+        if sel in seen:
+            continue
+        seen.add(sel)
+        if not group:
+            group = COACHING_PROVIDER_GROUPS.get(provider, 'Custom' if provider else 'Default')
+        if not label:
+            label = f"{COACHING_PROVIDER_GROUPS.get(provider, provider)} · {model or 'Account default'}" if provider else 'Worker config default'
+        out.append({'selection': sel, 'label': label, 'provider': provider, 'model': model, 'group': group})
+    return out
+
+
 def _sanitize_external_worker(raw, now):
     if not isinstance(raw, dict) or not isinstance(raw.get('id'), str) or not raw['id'].strip():
         raise ValueError('invalid_external_worker')
@@ -172,6 +272,9 @@ def _sanitize_external_worker(raw, now):
         'requested_model': _short_text(raw.get('requested_model'), 120),
         'status_text': _short_text(raw.get('status_text'), 200),
         'error': _short_text(raw.get('error'), 300),
+        'config_version': int(raw['config_version']) if isinstance(raw.get('config_version'), (int, float)) and not isinstance(raw.get('config_version'), bool) else None,
+        'active_selection': _short_text(raw.get('active_selection'), 120),
+        'available_models': _sanitize_coaching_models(raw.get('available_models')),
     }
     if 'providers' in raw and raw['providers'] is not None:
         body['providers'] = _validate_str_list(raw['providers'], 'invalid_external_worker')[:20]
@@ -246,7 +349,7 @@ class Store:
             fcntl.flock(schema_lock,fcntl.LOCK_EX)
             with self.tx() as db:
                 db.executescript('''
-                CREATE TABLE IF NOT EXISTS workers(id TEXT PRIMARY KEY, secret TEXT, body TEXT, seen REAL, sequence INTEGER DEFAULT 0, paused INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS workers(id TEXT PRIMARY KEY, secret TEXT, body TEXT, seen REAL, sequence INTEGER DEFAULT 0, paused INTEGER DEFAULT 0, cleanup_requested_sequence INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY, body TEXT, signature TEXT UNIQUE);
                 CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, source_id TEXT, body TEXT, status TEXT, created REAL, version INTEGER DEFAULT 1, attempt TEXT, available REAL DEFAULT 0, result TEXT, publication TEXT DEFAULT 'not_requested');
                 CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, task_id TEXT, worker_id TEXT, token TEXT, expires REAL, status TEXT, number INTEGER, body TEXT, result TEXT, media_state TEXT DEFAULT 'unknown', gc_eligible_since REAL, media_evicted_at REAL);
@@ -262,6 +365,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS artifact_pins(target_type TEXT NOT NULL,target_id TEXT NOT NULL,source_sha256 TEXT NOT NULL,holder_kind TEXT NOT NULL,holder_id TEXT NOT NULL,created REAL NOT NULL,expires REAL,metadata TEXT,PRIMARY KEY(target_type,target_id,holder_kind,holder_id));
                 CREATE TABLE IF NOT EXISTS external_workers(domain TEXT NOT NULL,id TEXT NOT NULL,seen REAL NOT NULL,paused INTEGER NOT NULL DEFAULT 0,sequence INTEGER NOT NULL DEFAULT 0,body TEXT NOT NULL,updated REAL NOT NULL,PRIMARY KEY(domain,id));
                 CREATE TABLE IF NOT EXISTS external_tasks(domain TEXT NOT NULL,identity TEXT NOT NULL,kind TEXT NOT NULL,status TEXT NOT NULL,worker_id TEXT,worker_role TEXT,session_id TEXT,session_name TEXT,provider TEXT,model TEXT,error TEXT,created REAL NOT NULL,updated REAL NOT NULL,body TEXT NOT NULL,PRIMARY KEY(domain,identity));
+                CREATE TABLE IF NOT EXISTS external_settings(domain TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 0,updated REAL NOT NULL,pending_sync INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(domain,key));
                 CREATE INDEX IF NOT EXISTS idx_external_tasks_sort ON external_tasks(updated DESC,created DESC);
                 ''')
                 # executescript commits its input transaction; reacquire the write lock
@@ -274,6 +378,9 @@ class Store:
                     db.execute('ALTER TABLE attempts ADD COLUMN gc_eligible_since REAL')
                 if 'media_evicted_at' not in cols:
                     db.execute('ALTER TABLE attempts ADD COLUMN media_evicted_at REAL')
+                worker_cols = {r['name'] for r in db.execute('PRAGMA table_info(workers)').fetchall()}
+                if 'cleanup_requested_sequence' not in worker_cols:
+                    db.execute('ALTER TABLE workers ADD COLUMN cleanup_requested_sequence INTEGER NOT NULL DEFAULT 0')
                 # Legacy attempts migrate as 'unknown' (never blindly 'available'); only failed/cancelled/dryrun are 'never_rendered'.
                 db.execute("UPDATE attempts SET media_state='never_rendered' WHERE media_state='unknown' AND (status IN ('failed','cancelled') OR task_id IN (SELECT id FROM tasks WHERE json_extract(body,'$.type')='dryrun'))")
 
@@ -692,10 +799,23 @@ class Store:
                         public[key]=body[key]
                 if body.get('runtime'): public['runtime']=body['runtime']
                 _validate_worker_ai_fields(public, body)
+                if 'scratch' in body:
+                    scratch = _sanitize_worker_scratch(body['scratch'])
+                    if scratch is None:
+                        public.pop('scratch', None)
+                    else:
+                        public['scratch'] = scratch
+                if 'last_cleanup' in body:
+                    cleanup_summary = _sanitize_worker_cleanup(body['last_cleanup'])
+                    if cleanup_summary is None:
+                        public.pop('last_cleanup', None)
+                    else:
+                        public['last_cleanup'] = cleanup_summary
                 public['snapshot']={k:body[k] for k in ('stage','progress','last_progress_at') if k in body}
                 public['snapshot']['local_state']={k:body.get('local_state',{}).get(k) for k in ('task_id','attempt_id','acknowledged_sequence')}
                 db.execute('UPDATE workers SET body=?,seen=?,sequence=? WHERE id=?',(encode(public),self.clock(),body['sequence'],worker))
-            return dict(renewal, server_time=self.clock(),pause_new_tasks=bool(w['paused']))
+            cleanup_seq = int(w['cleanup_requested_sequence'] or 0) if 'cleanup_requested_sequence' in w.keys() else 0
+            return dict(renewal, server_time=self.clock(),pause_new_tasks=bool(w['paused']),cleanup_requested_sequence=cleanup_seq)
 
     def events(self, worker, attempt, body):
         with self.tx() as db:
@@ -773,7 +893,25 @@ class Store:
 
     def workers(self):
         with self.tx() as db:
-            return [dict(json.loads(r['body']),id=r['id'],last_seen=r['seen'],online=self.clock()-r['seen']<90,paused=bool(r['paused']),version=r['sequence']) for r in db.execute('SELECT * FROM workers ORDER BY seen DESC')]
+            return [dict(json.loads(r['body']),id=r['id'],last_seen=r['seen'],online=self.clock()-r['seen']<90,paused=bool(r['paused']),version=r['sequence'],cleanup_requested_sequence=int(r['cleanup_requested_sequence'] or 0)) for r in db.execute('SELECT * FROM workers ORDER BY seen DESC')]
+
+    def request_worker_cleanup(self, identity=None):
+        """Increment cleanup_requested_sequence without altering worker heartbeat sequence."""
+        with self.tx() as db:
+            if identity is not None:
+                row = db.execute('SELECT id, cleanup_requested_sequence FROM workers WHERE id=?', (identity,)).fetchone()
+                if not row:
+                    raise KeyError(identity)
+                seq = int(row['cleanup_requested_sequence'] or 0) + 1
+                db.execute('UPDATE workers SET cleanup_requested_sequence=? WHERE id=?', (seq, identity))
+                return {'workers': [{'id': identity, 'cleanup_requested_sequence': seq}], 'cleanup_requested_sequence': seq}
+            rows = db.execute('SELECT id, cleanup_requested_sequence FROM workers ORDER BY seen DESC').fetchall()
+            updated = []
+            for row in rows:
+                seq = int(row['cleanup_requested_sequence'] or 0) + 1
+                db.execute('UPDATE workers SET cleanup_requested_sequence=? WHERE id=?', (seq, row['id']))
+                updated.append({'id': row['id'], 'cleanup_requested_sequence': seq})
+            return {'workers': updated}
 
     def available_ai_models(self):
         """Aggregate deduplicated AI models advertised across registered video workers."""
@@ -801,7 +939,100 @@ class Store:
                         entry['online_worker_count'] += 1
         return sorted(catalog.values(), key=lambda m: (str(m.get('provider') or ''), str(m.get('id') or '')))
 
-    def sync_external(self, domain, workers=None, tasks=None, deleted=None, snapshot=False, complete=True):
+    def _sync_external_settings(self, db, domain, settings, now):
+        if domain != 'coaching':
+            return None
+        row = db.execute("SELECT value, version, pending_sync FROM external_settings WHERE domain='coaching' AND key='ai_config'").fetchone()
+        existing = json.loads(row['value']) if row else None
+        existing_ver = int(row['version'] or 0) if row else 0
+        pending = bool(row['pending_sync']) if row else False
+        incoming_cfg = settings.get('ai_config') if isinstance(settings, dict) else None
+        if isinstance(incoming_cfg, dict) and isinstance(incoming_cfg.get('selection'), str):
+            try:
+                inc_sel, inc_prov, inc_mod = parse_coaching_ai_selection(incoming_cfg['selection'])
+            except ValueError:
+                inc_sel = None
+            if inc_sel is not None:
+                inc_ver = int(incoming_cfg.get('version') or 0)
+                if pending and isinstance(existing, dict):
+                    if inc_sel == existing.get('selection'):
+                        val = encode({'selection': inc_sel, 'provider': inc_prov, 'model': inc_mod})
+                        db.execute("INSERT INTO external_settings(domain,key,value,version,updated,pending_sync) VALUES('coaching','ai_config',?,?,?,0) ON CONFLICT(domain,key) DO UPDATE SET value=excluded.value,version=excluded.version,updated=excluded.updated,pending_sync=0", (val, max(existing_ver, inc_ver), now))
+                        return None
+                    return {'selection': existing['selection'], 'provider': existing.get('provider'), 'model': existing.get('model'), 'version': existing_ver}
+                if row is None or inc_ver >= existing_ver:
+                    val = encode({'selection': inc_sel, 'provider': inc_prov, 'model': inc_mod})
+                    db.execute("INSERT INTO external_settings(domain,key,value,version,updated,pending_sync) VALUES('coaching','ai_config',?,?,?,0) ON CONFLICT(domain,key) DO UPDATE SET value=excluded.value,version=excluded.version,updated=excluded.updated,pending_sync=0", (val, inc_ver, now))
+                return None
+        if pending and isinstance(existing, dict):
+            return {'selection': existing['selection'], 'provider': existing.get('provider'), 'model': existing.get('model'), 'version': existing_ver}
+        return None
+
+    def coaching_ai_config(self):
+        """Return mirrored AI coaching default model configuration and selectable presets."""
+        with self.tx() as db:
+            row = db.execute("SELECT value, version, updated, pending_sync FROM external_settings WHERE domain='coaching' AND key='ai_config'").fetchone()
+        if row:
+            try:
+                raw_val = json.loads(row['value'])
+                if not isinstance(raw_val, dict):
+                    raw_val = {}
+            except (ValueError, TypeError):
+                raw_val = {}
+            try:
+                selection, provider, model = parse_coaching_ai_selection(raw_val.get('selection', 'worker_default'))
+            except ValueError:
+                selection, provider, model = 'worker_default', None, None
+            version = int(row['version'] or 0)
+            updated_at = row['updated']
+            pending_sync = bool(row['pending_sync'])
+        else:
+            selection, provider, model = 'worker_default', None, None
+            version, updated_at, pending_sync = 0, None, False
+        ext_workers = [w for w in self.external_workers() if w.get('domain') == 'coaching' and w.get('role') == 'ai']
+        options = [dict(p) for p in COACHING_AI_PRESETS]
+        known = {opt['selection'] for opt in options}
+        if selection not in known:
+            prov_label = COACHING_PROVIDER_GROUPS.get(provider, provider or 'Custom')
+            options.append({'selection': selection, 'label': f'{prov_label} · {model or "Account default"}' if provider else selection, 'provider': provider, 'model': model, 'group': prov_label})
+            known.add(selection)
+        for w in ext_workers:
+            for item in w.get('available_models') or []:
+                if item['selection'] not in known:
+                    options.append(dict(item))
+                    known.add(item['selection'])
+        return {
+            'selection': selection,
+            'provider': provider,
+            'model': model,
+            'version': version,
+            'updated_at': updated_at,
+            'pending_sync': pending_sync,
+            'options': options,
+            'workers': [{'id': w['id'], 'label': w.get('label') or w['id'], 'online': bool(w.get('online')), 'status_text': w.get('status_text'), 'config_version': w.get('config_version')} for w in ext_workers],
+        }
+
+    def update_coaching_ai_config(self, selection, expected_version=None, forwarded_result=None):
+        """Update mirrored coaching default AI model selection, recording authoritative or pending state."""
+        norm_sel, provider, model = parse_coaching_ai_selection(selection)
+        now = self.clock()
+        with self.tx() as db:
+            row = db.execute("SELECT value, version, pending_sync FROM external_settings WHERE domain='coaching' AND key='ai_config'").fetchone()
+            current_ver = int(row['version'] or 0) if row else 0
+            if isinstance(forwarded_result, dict) and isinstance(forwarded_result.get('selection'), str):
+                f_sel, f_prov, f_mod = parse_coaching_ai_selection(forwarded_result['selection'])
+                f_ver = int(forwarded_result.get('version') if forwarded_result.get('version') is not None else current_ver)
+                val = encode({'selection': f_sel, 'provider': f_prov, 'model': f_mod})
+                db.execute("INSERT INTO external_settings(domain,key,value,version,updated,pending_sync) VALUES('coaching','ai_config',?,?,?,0) ON CONFLICT(domain,key) DO UPDATE SET value=excluded.value,version=excluded.version,updated=excluded.updated,pending_sync=0", (val, f_ver, now))
+            else:
+                if expected_version is not None and int(expected_version) != current_ver:
+                    raise Conflict('ai_config_version_conflict')
+                new_ver = current_ver + 1
+                val = encode({'selection': norm_sel, 'provider': provider, 'model': model})
+                db.execute("INSERT INTO external_settings(domain,key,value,version,updated,pending_sync) VALUES('coaching','ai_config',?,?,?,1) ON CONFLICT(domain,key) DO UPDATE SET value=excluded.value,version=excluded.version,updated=excluded.updated,pending_sync=1", (val, new_ver, now))
+        return self.coaching_ai_config()
+
+    def sync_external(self, domain, workers=None, tasks=None, deleted=None, snapshot=False, complete=True, settings=None):
         """Upsert or replace a sanitized external worker/task snapshot for one domain."""
         if domain not in EXTERNAL_DOMAINS:
             raise ValueError('invalid_external_domain')
@@ -851,7 +1082,11 @@ class Store:
                         db.execute('DELETE FROM external_tasks WHERE domain=?', (domain,))
             for ident in del_ids:
                 db.execute('DELETE FROM external_tasks WHERE domain=? AND identity=?', (domain, ident))
-        return {'domain': domain, 'workers': len(worker_rows) if workers is not None else 0, 'tasks': len(task_rows) if tasks is not None else 0, 'deleted': len(del_ids)}
+            desired_ai_config = self._sync_external_settings(db, domain, settings, now)
+        out = {'domain': domain, 'workers': len(worker_rows) if workers is not None else 0, 'tasks': len(task_rows) if tasks is not None else 0, 'deleted': len(del_ids)}
+        if desired_ai_config is not None:
+            out['desired_ai_config'] = desired_ai_config
+        return out
 
     def external_workers(self):
         """Return mirrored workers with dynamic staleness evaluated on server clock."""

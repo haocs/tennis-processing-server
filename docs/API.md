@@ -10,7 +10,7 @@ token from private server config. Never mirror credentials.
 | --- | --- |
 | POST `/workers/register` | display_name, platform, worker_version, capabilities[], accessible_storage_ids[], optional sanitized `ai_providers[]`, `ai_models[]`, `default_ai_model`. Returns individual worker ID/token (or refreshes existing authenticated worker). |
 | POST `/workers/{id}/profile` | Authenticated worker capability/runtime/AI profile refresh (`capabilities`, `accessible_storage_ids`, `worker_version`, `runtime`, `ai_providers`, `ai_models`, `default_ai_model`) preserving worker ID and lease state. |
-| POST `/workers/{id}/heartbeat` | increasing sequence; optional active `{attempt_id,lease_token}`, stage, last_progress_at, compact local_state, optional capability/runtime/AI refresh. Returns server_time/lease_expires_at/cancel/pause_new_tasks. |
+| POST `/workers/{id}/heartbeat` | increasing sequence; optional active `{attempt_id,lease_token}`, stage, last_progress_at, compact local_state (`scratch`, `last_cleanup`), optional capability/runtime/AI refresh. Returns server_time/lease_expires_at/cancel/pause_new_tasks/cleanup_requested_sequence. |
 | POST `/workers/{id}/claims` | request_id. 200 assignment or 204 idle. Busy worker gets its current assignment. Enforces derived `required_capabilities` (`cut-constraints-v1`, `hybrid-ai-vision-v1`), `required_storage_ids` (`processing`), and strict exact-model pinning when `allow_model_fallback=false`. |
 | GET `/attempts/{id}` | Assigned worker only; lease status and acknowledged event sequence. |
 | POST `/attempts/{id}/events` | lease_token, events[] with contiguous sequence, type, stage and compact metadata. Replays must match exactly. |
@@ -33,8 +33,11 @@ token from private server config. Never mirror credentials.
 | GET `/tasks/{id}/activation-preview` | Current active attempt for compare-and-swap activation. |
 | POST `/tasks/{id}/activate` | expected_active_attempt (null/legacy/attempt ID). Replay-safe activation from staging or `staged_candidate`; converts previous serving pin to `rollback_previous`. |
 | POST `/retention/sweep` | Disabled-by-default candidate retention sweep and crash recovery for `quarantined` attempts. |
-| GET `/workers` | Sanitized video workers (`items`, including advertised AI capability catalog), mirrored coaching/export workers (`external`), and aggregated `available_ai_models`. |
-| POST `/external-sync` | Same-origin / `X-Tennis-Request` sanitized snapshot or delta sync (`domain`: `coaching`/`exports`, `workers[]`, `tasks[]`, `deleted[]`, `snapshot`, `complete`). Stores only sanitized status/error summaries (no prompts, answers, credentials, or host paths). |
+| GET `/workers` | Sanitized video workers (`items`, including advertised AI capability catalog, `scratch`, and `cleanup` status), mirrored coaching/export workers (`external`), aggregated `available_ai_models`, and `coaching_ai_config`. |
+| POST `/workers/cleanup` and `/workers/{id}/cleanup` | Cooperative request asking idle/active video workers to delete completed local `state/tasks/<task_id>` directories while preserving active/pending tasks, pose caches, and `worker.json`. |
+| GET `/videos/staged-summary` | Active staged candidate counts and latest staged attempt metadata per `source_sha256` (`by_source`). |
+| GET/PUT `/coaching/ai-config` | Read or update default AI coaching model selection; forwards to `PROCESSING_WEBSITE_API_URL` `/api/coaching/config` when configured and falls back to `pending_sync` + `desired_ai_config` via `/external-sync`. |
+| POST `/external-sync` | Same-origin / `X-Tennis-Request` sanitized snapshot or delta sync (`domain`: `coaching`/`exports`, `workers[]`, `tasks[]`, `deleted[]`, `snapshot`, `complete`, optional `settings.ai_config`). Stores only sanitized status/error summaries and may return `desired_ai_config` for fallback convergence. |
 | GET `/external-tasks` | Filtered/paginated mirrored external tasks (`kind`: `ai_coach`/`learning_plan`/`clip_interval_export`/`coaching_excerpt_render`, `status`, `domain`, `limit<=200`, `offset`) plus `workers[]`. |
 | GET `/external-tasks/{domain}/{identity}` | Full sanitized metadata and error diagnostics for a single mirrored external task. |
 | PATCH `/workers/{id}` | paused, expected_version; pause affects future assignments. |
