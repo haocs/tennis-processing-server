@@ -887,8 +887,57 @@ def test_worker_portal_ui_browser(env):
     from werkzeug.serving import make_server
 
     app,c,h,s,cfg=env
-    w,_wh=worker(c)
-    t_vid=task(c,h,s,'dryrun','ui-vid')
+    ai_models=[
+        {'id':'antigravity:gemini-4-hydrogen-low','provider':'antigravity','model':'gemini-4-hydrogen-low','label':'Gemini 4 Hydrogen Low','is_default':True},
+        {'id':'gemini:gemini-2.5-flash','provider':'gemini','model':'gemini-2.5-flash','label':'Gemini 2.5 Flash','is_default':False},
+    ]
+    reg=c.post('/api/v1/workers/register',json={
+        'display_name':'Mac AI Worker',
+        'platform':'mac',
+        'worker_version':'2.0',
+        'capabilities':['process-v2','hybrid-ai-vision-v1'],
+        'accessible_storage_ids':['originals','processing'],
+        'ai_providers':['antigravity','gemini'],
+        'ai_models':ai_models,
+        'default_ai_model':'antigravity:gemini-4-hydrogen-low',
+    },headers={'Authorization':'Bearer test-secret'})
+    assert reg.status_code==201,reg.data
+    w,wh=reg.json['worker_id'],{'Authorization':'Bearer '+reg.json['worker_token'],'X-Worker-ID':reg.json['worker_id']}
+
+    # Queue and complete a hybrid dryrun task with compact ai_refinement findings so Inspect Run shows it.
+    ht=c.post('/api/v1/tasks',json={
+        'source_id':s,
+        'type':'dryrun',
+        'parameters':{'processing_strategy':'hybrid_ai_vision','ai_model':'antigravity:gemini-4-hydrogen-low','allow_model_fallback':True,'ai_tuning':{'aggressiveness':'balanced','accuracy_tier':'standard'}},
+    },headers=dict(h,**{'Idempotency-Key':'ui-hybrid'})).json['task_id']
+    ha=claim(c,w,wh)['attempt']
+    assert c.post('/api/v1/attempts/'+ha['id']+'/complete',json={
+        'task_id':ht,
+        'lease_token':ha['lease_token'],
+        'final_event_sequence':0,
+        'source_sha256':hashlib.sha256(b'input').hexdigest(),
+        'result_ref':None,
+        'findings':{
+            'clips':2,
+            'kept_seconds':18.5,
+            'ai_refinement':{
+                'processing_strategy':'hybrid_ai_vision',
+                'requested_ai_model':'antigravity:gemini-4-hydrogen-low',
+                'actual_ai_model':'gemini:gemini-2.5-flash',
+                'fallback_used':True,
+                'ai_tuning':{'aggressiveness':'balanced','accuracy_tier':'standard'},
+                'candidate_count':3,
+                'kept_count':1,
+                'trimmed_count':1,
+                'dropped_count':1,
+                'provenance_artifact':'ai-provenance.json',
+                'provenance_truncated':False,
+                'batch_provenance':[{'batch_id':'batch-001','candidate_ids':['C001','C002','C003'],'accepted_model':'gemini:gemini-2.5-flash'}],
+            },
+        },
+        'timing':{'total_seconds':4,'stages':[{'stage':'analyze','seconds':4}]},
+    },headers=dict(wh,**{'Idempotency-Key':'done-ui-hybrid'})).status_code==200
+
     now=app.config['STORE'].clock()
     assert c.post('/api/v1/external-sync',json={
         'domain':'coaching',
@@ -918,8 +967,12 @@ def test_worker_portal_ui_browser(env):
                 body_text=page.inner_text('body')
                 assert 'Worker portal' in body_text
                 assert 'processing room' not in body_text.lower()
-                assert 'AI coach' in page.inner_text('#workers')
-                assert 'Media export' in page.inner_text('#workers')
+                workers_text=page.inner_text('#workers')
+                assert 'Vision + Hybrid AI · 2 models · Default: gemini-4-hydrogen-low' in workers_text
+                assert page.locator('#workers select').count()==0
+                assert 'AI coach' in workers_text
+                assert 'Media export' in workers_text
+                assert 'hybrid · gemini-2.5-flash · fallback' in page.inner_text('#tasks')
                 assert 'Provider gateway returned 502' in page.inner_text('#tasks')
                 assert 'Clip interval · 0:08–0:20' in page.inner_text('#tasks')
                 assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
@@ -927,6 +980,31 @@ def test_worker_portal_ui_browser(env):
                 assert 'Clip interval · 0:08–0:20' in page.inner_text('#tasks')
                 assert 'AI coach · Forehand ask' not in page.inner_text('#tasks')
                 page.select_option('#kind-filter','')
+
+                # Inspect video hybrid run details -> shows ai_refinement provenance summary
+                page.click(f'button[data-detail="{ht}"]')
+                page.wait_for_selector('#detail[open]')
+                detail_text=page.inner_text('#detail')
+                assert 'AI Refinement (hybrid_ai_vision)' in detail_text
+                assert 'gemini:gemini-2.5-flash' in detail_text
+                assert 'metadata/ai-provenance.json' in detail_text
+                page.click('#detail button[data-close]')
+
+                # Per-task AI selection in #task-form (only on desktop pass to keep watcher state clean across iterations)
+                if width==1280:
+                    page.click('#new-task')
+                    page.wait_for_selector('#task-form[open]')
+                    assert page.locator('#task-ai-panel').is_hidden()
+                    assert page.locator('#task-form option[value="ai_only"]').evaluate('el => el.disabled') is True
+                    assert page.locator('#watcher-form option[value="ai_only"]').evaluate('el => el.disabled') is True
+                    page.select_option('#task-form select[name="processing_strategy"]','hybrid_ai_vision')
+                    assert page.locator('#task-ai-panel').is_visible()
+                    page.select_option('#task-form select[name="ai_model"]','gemini:gemini-2.5-flash')
+                    page.select_option('#task-form select[name="aggressiveness"]','aggressive')
+                    page.click('#task-form button:not([type="button"])')
+                    page.wait_for_function("() => !document.querySelector('#task-form').open")
+                    page.wait_for_function("() => document.querySelector('#tasks').innerText.includes('aggressive/standard')")
+
                 page.click('button[data-ext-detail="coaching/coach%3Aui"]')
                 page.wait_for_selector('#detail[open]')
                 modal_text=page.inner_text('#detail')
@@ -939,3 +1017,203 @@ def test_worker_portal_ui_browser(env):
     finally:
         server.shutdown()
         thread.join(timeout=2)
+
+
+def test_processing_strategy_parameter_validation_and_defaults(env):
+    app,c,h,s,cfg=env
+    # Omitted strategy keeps {} unchanged for legacy compatibility
+    r_def=c.post('/api/v1/tasks',json={'source_id':s,'type':'dryrun','parameters':{}},headers=dict(h,**{'Idempotency-Key':'strat-def'}))
+    assert r_def.status_code==201
+    t_def=c.get('/api/v1/tasks/'+r_def.json['task_id']).json
+    assert t_def['parameters']=={}
+    assert 'hybrid-ai-vision-v1' not in (t_def.get('required_capabilities') or [])
+
+    # ai_only is reserved and rejected with unsupported_processing_strategy
+    r_ai_only=c.post('/api/v1/tasks',json={'source_id':s,'type':'dryrun','parameters':{'processing_strategy':'ai_only'}},headers=dict(h,**{'Idempotency-Key':'strat-aionly'}))
+    assert r_ai_only.status_code==400 and r_ai_only.json['error']['code']=='unsupported_processing_strategy'
+
+    # Unknown strategy or AI keys on vision_only fail cleanly
+    r_bad=c.post('/api/v1/tasks',json={'source_id':s,'type':'dryrun','parameters':{'processing_strategy':'bogus'}},headers=dict(h,**{'Idempotency-Key':'strat-bogus'}))
+    assert r_bad.status_code==400 and r_bad.json['error']['code']=='invalid_processing_strategy'
+    r_mix=c.post('/api/v1/tasks',json={'source_id':s,'type':'dryrun','parameters':{'processing_strategy':'vision_only','ai_model':'auto'}},headers=dict(h,**{'Idempotency-Key':'strat-mix'}))
+    assert r_mix.status_code==400 and r_mix.json['error']['code']=='ai_parameters_require_ai_strategy'
+    r_bad_bool=c.post('/api/v1/tasks',json={'source_id':s,'type':'dryrun','parameters':{'processing_strategy':'hybrid_ai_vision','allow_model_fallback':'yes'}},headers=dict(h,**{'Idempotency-Key':'strat-bool'}))
+    assert r_bad_bool.status_code==400 and r_bad_bool.json['error']['code']=='invalid_allow_model_fallback'
+    r_bad_tune=c.post('/api/v1/tasks',json={'source_id':s,'type':'dryrun','parameters':{'processing_strategy':'hybrid_ai_vision','ai_tuning':{'aggressiveness':'turbo'}}},headers=dict(h,**{'Idempotency-Key':'strat-tune'}))
+    assert r_bad_tune.status_code==400 and r_bad_tune.json['error']['code']=='invalid_ai_tuning'
+
+    # hybrid_ai_vision fills defaults and derives hybrid-ai-vision-v1
+    r_hyb=c.post('/api/v1/tasks',json={'source_id':s,'type':'dryrun','parameters':{'processing_strategy':'hybrid_ai_vision'}},headers=dict(h,**{'Idempotency-Key':'strat-hyb'}))
+    assert r_hyb.status_code==201,r_hyb.data
+    t_hyb=c.get('/api/v1/tasks/'+r_hyb.json['task_id']).json
+    assert t_hyb['parameters']=={
+        'processing_strategy':'hybrid_ai_vision',
+        'ai_model':'auto',
+        'allow_model_fallback':True,
+        'ai_tuning':{'aggressiveness':'balanced','accuracy_tier':'standard'},
+    }
+    assert 'hybrid-ai-vision-v1' in t_hyb['required_capabilities']
+
+
+def test_worker_ai_model_catalog_and_strict_claim_matching(env):
+    app,c,h,s,cfg=env
+    # Worker A: vision only
+    w_vis,wh_vis=worker(c)
+    # Worker B: hybrid AI with two models
+    models_b=[
+        {'id':'antigravity:gemini-4-hydrogen-low','provider':'antigravity','model':'gemini-4-hydrogen-low','label':'Gemini 4 Hydrogen Low','is_default':True},
+        {'id':'gemini:gemini-2.5-flash','provider':'gemini','model':'gemini-2.5-flash','label':'Gemini 2.5 Flash','is_default':False},
+    ]
+    reg_b=c.post('/api/v1/workers/register',json={
+        'display_name':'Worker B',
+        'platform':'mac',
+        'worker_version':'2.0',
+        'capabilities':['process-v2','hybrid-ai-vision-v1'],
+        'accessible_storage_ids':['originals','processing'],
+        'ai_providers':['antigravity','gemini'],
+        'ai_models':models_b,
+        'default_ai_model':'antigravity:gemini-4-hydrogen-low',
+    },headers={'Authorization':'Bearer test-secret'}).json
+    w_b,wh_b=reg_b['worker_id'],{'Authorization':'Bearer '+reg_b['worker_token'],'X-Worker-ID':reg_b['worker_id']}
+
+    # Worker C: hybrid AI with only codex model
+    reg_c=c.post('/api/v1/workers/register',json={
+        'display_name':'Worker C',
+        'platform':'mac',
+        'worker_version':'2.0',
+        'capabilities':['process-v2','hybrid-ai-vision-v1'],
+        'accessible_storage_ids':['originals','processing'],
+        'ai_providers':['codex'],
+        'ai_models':[{'id':'codex:default','provider':'codex','model':'default','label':'Codex Default','is_default':True}],
+        'default_ai_model':'codex:default',
+    },headers={'Authorization':'Bearer test-secret'}).json
+    w_c,wh_c=reg_c['worker_id'],{'Authorization':'Bearer '+reg_c['worker_token'],'X-Worker-ID':reg_c['worker_id']}
+
+    cat=c.get('/api/v1/workers').json
+    model_ids={m['id']:m for m in cat['available_ai_models']}
+    assert {'antigravity:gemini-4-hydrogen-low','gemini:gemini-2.5-flash','codex:default'}.issubset(set(model_ids))
+    assert model_ids['codex:default']['online_worker_count']==1
+
+    # Strict pin to gemini:gemini-2.5-flash with allow_model_fallback=False:
+    t_pin=c.post('/api/v1/tasks',json={
+        'source_id':s,
+        'type':'dryrun',
+        'parameters':{'processing_strategy':'hybrid_ai_vision','ai_model':'gemini:gemini-2.5-flash','allow_model_fallback':False},
+    },headers=dict(h,**{'Idempotency-Key':'claim-pin'})).json['task_id']
+    # Vision worker cannot claim it
+    assert c.post('/api/v1/workers/'+w_vis+'/claims',json={'request_id':'v1'},headers=wh_vis).status_code==204
+    # Codex-only worker C cannot claim it
+    assert c.post('/api/v1/workers/'+w_c+'/claims',json={'request_id':'c1'},headers=wh_c).status_code==204
+    # Worker B owns gemini:gemini-2.5-flash and claims it
+    claimed_b=claim(c,w_b,wh_b)
+    assert claimed_b['task']['id']==t_pin
+
+    # Flexible fallback task targeting codex:default with allow_model_fallback=True CAN be claimed by Worker C (and if B claims, B also has non-empty ai_models)
+    t_flex=c.post('/api/v1/tasks',json={
+        'source_id':s,
+        'type':'dryrun',
+        'parameters':{'processing_strategy':'hybrid_ai_vision','ai_model':'codex:default','allow_model_fallback':True},
+    },headers=dict(h,**{'Idempotency-Key':'claim-flex'})).json['task_id']
+    assert claim(c,w_c,wh_c)['task']['id']==t_flex
+
+
+def test_snapshot_override_precedence_and_nested_ai_tuning_rerun(env):
+    app,c,h,s,cfg=env
+    w,wh=worker(c)
+    t_res=c.post('/api/v1/tasks',json={
+        'source_id':s,
+        'type':'process',
+        'parameters':{
+            'processing_strategy':'hybrid_ai_vision',
+            'ai_model':'antigravity:gemini-4-hydrogen-low',
+            'swing_speed':2.0,
+            'ai_tuning':{'aggressiveness':'balanced','accuracy_tier':'thorough'},
+        },
+    },headers=dict(h,**{'Idempotency-Key':'base-ai'}))
+    assert t_res.status_code==201,t_res.data
+    t_id=t_res.json['task_id']
+    # Register an AI worker to complete the base process task
+    reg=c.post('/api/v1/workers/register',json={
+        'display_name':'AI Worker',
+        'platform':'mac',
+        'worker_version':'2.0',
+        'capabilities':['process-v2','hybrid-ai-vision-v1','cut-constraints-v1'],
+        'accessible_storage_ids':['originals','processing'],
+        'ai_providers':['antigravity'],
+        'ai_models':[{'id':'antigravity:gemini-4-hydrogen-low','provider':'antigravity','model':'gemini-4-hydrogen-low','label':'Hydrogen Low','is_default':True}],
+        'default_ai_model':'antigravity:gemini-4-hydrogen-low',
+    },headers={'Authorization':'Bearer test-secret'}).json
+    wa,wha=reg['worker_id'],{'Authorization':'Bearer '+reg['worker_token'],'X-Worker-ID':reg['worker_id']}
+    a=claim(c,wa,wha)['attempt']
+    digest=hashlib.sha256(b'input').hexdigest()
+    _write_process_attempt_bundle(cfg,t_id,a['id'],digest)
+    assert c.post('/api/v1/attempts/'+a['id']+'/complete',json={'task_id':t_id,'lease_token':a['lease_token'],'final_event_sequence':0,'source_sha256':digest,'result_ref':{'storage_id':'processing','path':f'runs/{t_id}/{a["id"]}/result.json'}},headers=dict(wha,**{'Idempotency-Key':'done-base-ai'})).status_code==200
+    assert c.post('/api/v1/tasks/'+t_id+'/stage-candidate',json={},headers=h).status_code==200
+
+    snap_payload=_valid_snapshot_payload(digest,a['id'])
+    snap_payload['parameter_overrides']={
+        'swing_speed':2.5,
+        'processing_strategy':'hybrid_ai_vision',
+        'ai_tuning':{'aggressiveness':'conservative'},
+    }
+    snap_res=c.post('/api/v1/feedback-snapshots',json=snap_payload,headers=dict(h,**{'Idempotency-Key':'snap-ai'}))
+    assert snap_res.status_code==201,snap_res.data
+    snap_id=snap_res.json['snapshot_id']
+    snap_sha=snap_res.json['snapshot_sha256']
+    assert json.loads((Path(cfg['storage']['processing']['path'])/snap_res.json['snapshot_ref']['path']).read_text())['parameter_overrides']==snap_payload['parameter_overrides']
+    assert hashlib.sha256((Path(cfg['storage']['processing']['path'])/snap_res.json['snapshot_ref']['path']).read_bytes()).hexdigest()==snap_sha
+
+    # Explicit caller conflict on numeric or nested ai_tuning subkey -> 409
+    bad1=c.post('/api/v1/tasks/'+t_id+'/rerun',json={'feedback_snapshot_id':snap_id,'parameters':{'swing_speed':1.8}},headers=dict(h,**{'Idempotency-Key':'rr-conf-num'}))
+    assert bad1.status_code==409 and bad1.json['error']['code']=='parameter_override_mismatch'
+    bad2=c.post('/api/v1/tasks/'+t_id+'/rerun',json={'feedback_snapshot_id':snap_id,'parameters':{'ai_tuning':{'aggressiveness':'aggressive'}}},headers=dict(h,**{'Idempotency-Key':'rr-conf-tune'}))
+    assert bad2.status_code==409 and bad2.json['error']['code']=='parameter_override_mismatch'
+
+    # Rerun with only padding_before override -> snapshot overrides parent swing_speed and ai_tuning.aggressiveness, while preserving parent accuracy_tier='thorough' and ai_model!
+    ok_rr=c.post('/api/v1/tasks/'+t_id+'/rerun',json={'feedback_snapshot_id':snap_id,'parameters':{'padding_before':3.0}},headers=dict(h,**{'Idempotency-Key':'rr-merge-ok'}))
+    assert ok_rr.status_code==201,ok_rr.data
+    det=c.get('/api/v1/tasks/'+ok_rr.json['task_id']).json
+    assert det['parameters']['swing_speed']==2.5
+    assert det['parameters']['padding_before']==3.0
+    assert det['parameters']['ai_model']=='antigravity:gemini-4-hydrogen-low'
+    assert det['parameters']['ai_tuning']=={'aggressiveness':'conservative','accuracy_tier':'thorough'}
+
+    # Rerun without snapshot switching back to vision_only cleanly strips inherited AI keys
+    vis_rr=c.post('/api/v1/tasks/'+t_id+'/rerun',json={'parameters':{'processing_strategy':'vision_only'}},headers=dict(h,**{'Idempotency-Key':'rr-vis'}))
+    assert vis_rr.status_code==201,vis_rr.data
+    vis_det=c.get('/api/v1/tasks/'+vis_rr.json['task_id']).json
+    assert vis_det['parameters']['processing_strategy']=='vision_only'
+    assert not any(k in vis_det['parameters'] for k in ('ai_model','allow_model_fallback','ai_tuning'))
+    assert 'hybrid-ai-vision-v1' not in (vis_det.get('required_capabilities') or [])
+
+
+def test_watcher_hybrid_ai_validation_and_cut_constraints_ban(env):
+    app,c,h,s,cfg=env
+    # Watchers forbid cut_constraints_ref and ai_only
+    bad_cc=c.post('/api/v1/watchers',json={'storage_id':'originals','path':'','enabled':False,'parameters':{'cut_constraints_ref':{'storage_id':'processing','path':'snapshots/x.json'}}},headers=h)
+    assert bad_cc.status_code==400 and bad_cc.json['error']['code']=='cut_constraints_forbidden_in_watcher'
+    bad_ai=c.post('/api/v1/watchers',json={'storage_id':'originals','path':'','enabled':False,'parameters':{'processing_strategy':'ai_only'}},headers=h)
+    assert bad_ai.status_code==400 and bad_ai.json['error']['code']=='unsupported_processing_strategy'
+
+    # Valid hybrid watcher normalized and scan routes through prepare_task_spec (derives hybrid-ai-vision-v1)
+    w_res=c.post('/api/v1/watchers',json={
+        'storage_id':'originals',
+        'path':'',
+        'enabled':True,
+        'settle_seconds':10,
+        'parameters':{'processing_strategy':'hybrid_ai_vision','ai_model':'gemini:gemini-2.5-flash'},
+    },headers=h)
+    assert w_res.status_code==201,w_res.data
+    wid=w_res.json['id']
+    assert w_res.json['parameters']['ai_tuning']=={'aggressiveness':'balanced','accuracy_tier':'standard'}
+
+    # Advance store clock past settle window so existing match.mov is queued on second scan
+    clock=[1000]
+    app.config['STORE'].clock=lambda:clock[0]
+    assert c.post(f'/api/v1/watchers/{wid}/scan',json={},headers=h).status_code==202
+    clock[0]=1025
+    assert c.post(f'/api/v1/watchers/{wid}/scan',json={},headers=h).status_code==202
+    tasks=c.get('/api/v1/tasks').json['items']
+    hybrid_tasks=[t for t in tasks if t.get('trigger')=='watcher' and t.get('parameters',{}).get('processing_strategy')=='hybrid_ai_vision']
+    assert len(hybrid_tasks)==1
+    assert 'hybrid-ai-vision-v1' in hybrid_tasks[0]['required_capabilities']

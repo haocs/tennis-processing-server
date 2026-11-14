@@ -266,17 +266,9 @@ def create_app(config=None):
     @app.post('/api/v1/tasks/<identity>/rerun')
     def rerun(identity):
         previous=store.detail(identity);b=body()
-        spec={k:previous[k] for k in ('source_id','type','executor','parameters','priority','max_attempts') if k in previous}
-        if 'parameters' in b and isinstance(b['parameters'],dict):
-            merged_params=dict(previous.get('parameters') or {})
-            if 'feedback_snapshot_id' in b and 'cut_constraints_ref' not in b['parameters']:
-                merged_params.pop('cut_constraints_ref',None)
-            merged_params.update(b['parameters'])
-            b=dict(b,parameters=merged_params)
-        elif 'feedback_snapshot_id' in b:
-            merged_params=dict(previous.get('parameters') or {})
-            merged_params.pop('cut_constraints_ref',None)
-            b=dict(b,parameters=merged_params)
+        if 'parameters' in b and b['parameters'] is not None and not isinstance(b['parameters'],dict):
+            raise ValueError('invalid_parameters')
+        spec={k:previous[k] for k in ('source_id','type','executor','priority','max_attempts') if k in previous}
         spec.update(b,parent_task_id=identity,publication_policy=b.get('publication_policy','never'))
         return jsonify(store.enqueue(task_spec(spec,parent_task=previous),request.headers.get('Idempotency-Key'))),201
     @app.post('/api/v1/tasks/<identity>/cancel')
@@ -305,7 +297,7 @@ def create_app(config=None):
         body()
         return jsonify(files.run_retention(store))
     @app.get('/api/v1/workers')
-    def workers(): return jsonify(items=store.workers(), external=store.external_workers())
+    def workers(): return jsonify(items=store.workers(), external=store.external_workers(), available_ai_models=store.available_ai_models())
     @app.post('/api/v1/external-sync')
     def external_sync():
         b=body()

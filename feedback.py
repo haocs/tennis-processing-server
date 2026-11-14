@@ -9,7 +9,15 @@ MAX_BYTES=128*1024
 MAX_ARTIFACT_BYTES=256*1024
 MAX_HEURISTICS_BYTES=512*1024
 COMMANDS={'keep_intervals_ms','exclude_intervals_ms','override_clip_bounds_ms'}
-PARAMETERS={'target_region','min_player_height','swing_speed','arm_reach','padding_before','padding_after','merge_gap'}
+NUMERIC_PARAMETERS={'target_region','min_player_height','swing_speed','arm_reach','padding_before','padding_after','merge_gap'}
+AI_PARAMETERS={'ai_model','allow_model_fallback','ai_tuning'}
+PARAMETERS=NUMERIC_PARAMETERS|{'processing_strategy'}|AI_PARAMETERS
+PROCESSING_STRATEGIES=('vision_only','hybrid_ai_vision','ai_only')
+SUPPORTED_PROCESSING_STRATEGIES=('vision_only','hybrid_ai_vision')
+AI_AGGRESSIVENESS_LEVELS=('conservative','balanced','aggressive')
+AI_ACCURACY_TIERS=('fast','standard','thorough')
+AI_PROVIDERS=('antigravity','gemini','codex')
+AI_MODEL_RE=re.compile(r'^(antigravity|gemini|codex):[A-Za-z0-9._-]{1,64}$')
 FORBIDDEN_TRUTH_CLAIMS={'verified_play','verified_tennis','verified_swing','ground_truth','human_verified','benchmark_truth'}
 
 class InvalidFeedback(ValueError):
@@ -28,13 +36,62 @@ def overlaps(a,b):
     return max(a[0],b[0])<min(a[1],b[1])
 
 
+def _validate_ai_tuning(tuning,error_cls):
+    if not isinstance(tuning,dict) or set(tuning)-{'aggressiveness','accuracy_tier'}:
+        raise error_cls('invalid_ai_tuning')
+    if 'aggressiveness' in tuning:
+        agg=tuning['aggressiveness']
+        if not isinstance(agg,str) or agg not in AI_AGGRESSIVENESS_LEVELS:
+            raise error_cls('invalid_ai_tuning')
+    if 'accuracy_tier' in tuning:
+        tier=tuning['accuracy_tier']
+        if not isinstance(tier,str) or tier not in AI_ACCURACY_TIERS:
+            raise error_cls('invalid_ai_tuning')
+
+
 def validate_parameter_map(parameters,error_cls=InvalidFeedback,code='invalid_parameter_overrides'):
+    """Validate task or snapshot parameter overrides without mutating the input mapping."""
     def fail():raise error_cls(code)
     if not isinstance(parameters,dict) or set(parameters)-PARAMETERS:fail()
+    strategy='vision_only'
+    if 'processing_strategy' in parameters:
+        strategy=parameters['processing_strategy']
+        if not isinstance(strategy,str) or strategy not in PROCESSING_STRATEGIES:
+            raise error_cls('invalid_processing_strategy')
+        if strategy=='ai_only':
+            raise error_cls('unsupported_processing_strategy')
+    if strategy=='vision_only' and any(k in parameters for k in AI_PARAMETERS):
+        raise error_cls('ai_parameters_require_ai_strategy')
     for key,value in parameters.items():
         if key=='target_region':
             if not isinstance(value,list) or len(value)!=4 or any(type(v) not in (float,int) or not math.isfinite(v) or not 0<=v<=1 for v in value) or not value[0]<value[2] or not value[1]<value[3]:fail()
+        elif key=='processing_strategy':
+            continue
+        elif key=='ai_model':
+            if not isinstance(value,str) or (value!='auto' and not AI_MODEL_RE.fullmatch(value)):
+                raise error_cls('invalid_ai_model')
+        elif key=='allow_model_fallback':
+            if type(value) is not bool:
+                raise error_cls('invalid_allow_model_fallback')
+        elif key=='ai_tuning':
+            _validate_ai_tuning(value,error_cls)
         elif type(value) not in (int,float) or not math.isfinite(value) or value<0 or value>10000:fail()
+
+
+def normalize_task_parameters(parameters,error_cls=ValueError,code='invalid_parameters'):
+    """Validate and return a normalized parameter dict preserving legacy empty/{} omissions."""
+    validate_parameter_map(parameters,error_cls=error_cls,code=code)
+    out=copy.deepcopy(parameters)
+    if out.get('processing_strategy')=='hybrid_ai_vision':
+        out.setdefault('ai_model','auto')
+        if 'allow_model_fallback' not in out:
+            out['allow_model_fallback']=True
+        tuning=dict(out.get('ai_tuning') or {})
+        out['ai_tuning']={
+            'aggressiveness':tuning.get('aggressiveness','balanced'),
+            'accuracy_tier':tuning.get('accuracy_tier','standard'),
+        }
+    return out
 
 
 def validate_snapshot(payload,base):

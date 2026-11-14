@@ -4,8 +4,19 @@ import os
 from pathlib import Path
 import time
 from flask import jsonify
+from feedback import normalize_task_parameters
 from files import atomic, inside
 from store import encode, uid, Conflict
+
+
+def _validate_watcher_parameters(params):
+    if params is None:
+        return {}
+    if not isinstance(params, dict):
+        raise ValueError('invalid_parameters')
+    if 'cut_constraints_ref' in params:
+        raise ValueError('cut_constraints_forbidden_in_watcher')
+    return normalize_task_parameters(params, ValueError, 'invalid_parameters')
 
 
 def scan(store, files, watcher_id):
@@ -29,10 +40,11 @@ def scan(store, files, watcher_id):
                         db.execute('INSERT OR REPLACE INTO observations VALUES(?,?,?,?)',(watcher_id,relative,sig,now));continue
                     if now-previous['stable']<watcher.get('settle_seconds',180): continue
                 source=store.source({'storage_id':watcher['storage_id'],'path':relative,'bytes':stat.st_size,'modified_ns':stat.st_mtime_ns,'sha256':None})
-                body={'source_id':source,'type':'process','executor':'process-v2','parameters':watcher.get('parameters',{}),'priority':0,'max_attempts':3,'publication_policy':'if_no_active_result','trigger':'watcher'}
+                raw_spec={'source_id':source,'type':'process','executor':'process-v2','parameters':watcher.get('parameters',{}),'priority':0,'max_attempts':3,'publication_policy':'if_no_active_result','trigger':'watcher'}
+                spec=files.prepare_task_spec(store,raw_spec)
                 with store.tx() as db:
                     existing=db.execute("SELECT 1 FROM tasks WHERE source_id=? AND json_extract(body,'$.type')='process' LIMIT 1",(source,)).fetchone()
-                if not existing: store.enqueue(body,f'watcher-{watcher_id}-{source}')
+                if not existing: store.enqueue(spec,f'watcher-{watcher_id}-{source}')
                 found+=1
         result={'id':scan_id,'watcher_id':watcher_id,'status':'succeeded','observed_stable_files':found,'finished_at':store.clock()}
     except OSError:
@@ -96,7 +108,8 @@ def routes(app,store,files,body):
         b=body();root=files.root(b['storage_id'])
         if b['storage_id']!='originals': raise ValueError('watcher_requires_originals')
         if b.get('path'): inside(root,b['path'])
-        value={k:b[k] for k in ('storage_id','path','enabled','settle_seconds','parameters') if k in b}
+        value={k:b[k] for k in ('storage_id','path','enabled','settle_seconds') if k in b}
+        value['parameters']=_validate_watcher_parameters(b.get('parameters'))
         value.update(path=b.get('path',''),enabled=bool(b.get('enabled',False)),settle_seconds=max(10,int(b.get('settle_seconds',180))))
         identity=uid()
         with store.tx() as db: db.execute('INSERT INTO watchers VALUES(?,?,1)',(identity,encode(value)))
@@ -109,8 +122,10 @@ def routes(app,store,files,body):
             if not row: raise KeyError('watcher_not_found')
             if b['expected_version']!=row['version']: raise Conflict('version_conflict')
             value=json.loads(row['body'])
-            for key in ('enabled','parameters','settle_seconds'):
+            for key in ('enabled','settle_seconds'):
                 if key in b: value[key]=b[key]
+            if 'parameters' in b:
+                value['parameters']=_validate_watcher_parameters(b['parameters'])
             value['settle_seconds']=max(10,int(value.get('settle_seconds',180)))
             db.execute('UPDATE watchers SET body=?,version=version+1 WHERE id=?',(encode(value),identity))
         return jsonify(id=identity,**value)

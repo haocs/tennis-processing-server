@@ -1,4 +1,5 @@
 """Safe storage references and publication by same-filesystem rename (no media recopy)."""
+import copy
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import shutil
 import uuid
 from store import Conflict, encode, uid
 from feedback import (
+    AI_PARAMETERS,
     InvalidFeedback,
     MAX_ARTIFACT_BYTES,
     MAX_BYTES,
@@ -15,6 +17,7 @@ from feedback import (
     PARAMETERS,
     build_snapshot_artifact,
     canonical,
+    normalize_task_parameters,
     validate_heuristics,
     validate_parameter_map,
     validate_snapshot,
@@ -574,6 +577,25 @@ class Files:
                 'created_at':row['created'],
             }
 
+    def _merge_task_parameters(self, inherited_params, caller_params, snap_overrides):
+        """Merge inherited < caller < snapshot overrides with nested ai_tuning support."""
+        base = copy.deepcopy(inherited_params)
+        if caller_params.get('processing_strategy') == 'vision_only' or snap_overrides.get('processing_strategy') == 'vision_only':
+            for ai_key in AI_PARAMETERS:
+                base.pop(ai_key, None)
+        merged = base
+        for pk, pv in caller_params.items():
+            if pk == 'ai_tuning' and isinstance(pv, dict) and isinstance(merged.get('ai_tuning'), dict):
+                merged['ai_tuning'] = {**merged['ai_tuning'], **copy.deepcopy(pv)}
+            else:
+                merged[pk] = copy.deepcopy(pv)
+        for pk, pv in snap_overrides.items():
+            if pk == 'ai_tuning' and isinstance(pv, dict) and isinstance(merged.get('ai_tuning'), dict):
+                merged['ai_tuning'] = {**merged['ai_tuning'], **copy.deepcopy(pv)}
+            else:
+                merged[pk] = copy.deepcopy(pv)
+        return merged
+
     def prepare_task_spec(self, store, b, parent_task=None):
         if b.get('type') not in ('process','dryrun','experiment'):
             raise ValueError('invalid_task_type')
@@ -582,16 +604,21 @@ class Files:
         source_id=b.get('source_id')
         if not isinstance(source_id,str) or not source_id:
             raise ValueError('source_id_required')
+        if 'parameters' in b and b['parameters'] is not None and not isinstance(b['parameters'],dict):
+            raise ValueError('invalid_parameters')
         with store.tx() as db:
             src_row=db.execute('SELECT * FROM sources WHERE id=?',(source_id,)).fetchone()
             if not src_row:
                 raise KeyError('source_not_found')
             src_body=json.loads(src_row['body'])
-            raw_params=dict(b.get('parameters') or {})
-            if not isinstance(b.get('parameters',{}),dict):
-                raise ValueError('invalid_parameters')
+            caller_params=copy.deepcopy(b.get('parameters') or {})
+            inherited_params=copy.deepcopy((parent_task.get('parameters') or {}) if isinstance(parent_task,dict) else {})
             snapshot_id=b.get('feedback_snapshot_id')
+            if snapshot_id is not None and 'cut_constraints_ref' not in caller_params:
+                inherited_params.pop('cut_constraints_ref',None)
             snap_row=None
+            snap_overrides={}
+            constraints_ref=caller_params.get('cut_constraints_ref') if 'cut_constraints_ref' in caller_params else inherited_params.get('cut_constraints_ref')
             if snapshot_id is not None:
                 if not isinstance(snapshot_id,str) or not snapshot_id:
                     raise ValueError('invalid_feedback_snapshot_id')
@@ -604,15 +631,12 @@ class Files:
                     raise ValueError('snapshot_source_mismatch')
                 snap_ref=json.loads(snap_row['storage_ref'])
                 snap_body=json.loads(snap_row['body'])
-                if 'cut_constraints_ref' in raw_params and raw_params['cut_constraints_ref'] is not None:
-                    supplied=raw_params['cut_constraints_ref']
+                if 'cut_constraints_ref' in caller_params and caller_params['cut_constraints_ref'] is not None:
+                    supplied=caller_params['cut_constraints_ref']
                     if not isinstance(supplied,dict) or supplied.get('path')!=snap_ref['path'] or (supplied.get('sha256') and supplied['sha256']!=snap_ref['sha256']):
                         raise Conflict('conflicting_cut_constraints_ref')
-                raw_params['cut_constraints_ref']=snap_ref
-                for pk,pv in (snap_body.get('parameter_overrides') or {}).items():
-                    raw_params.setdefault(pk,pv)
-            constraints_ref=raw_params.pop('cut_constraints_ref',None)
-            validate_parameter_map(raw_params,ValueError,'invalid_parameters')
+                constraints_ref=snap_ref
+                snap_overrides=snap_body.get('parameter_overrides') or {}
             req_caps=[]
             if 'required_capabilities' in b and b['required_capabilities'] is not None:
                 if not isinstance(b['required_capabilities'],list) or any(not isinstance(x,str) or not x for x in b['required_capabilities']):
@@ -621,6 +645,7 @@ class Files:
             req_storage=[src_body['storage_id']]
             if b.get('type')!='dryrun' and 'processing' not in req_storage:
                 req_storage.append('processing')
+            verified_constraints_ref=None
             if constraints_ref is not None:
                 if not isinstance(constraints_ref,dict) or constraints_ref.get('storage_id')!='processing' or not isinstance(constraints_ref.get('path'),str):
                     raise ValueError('invalid_cut_constraints_ref')
@@ -634,7 +659,8 @@ class Files:
                 if constraints_ref.get('bytes') is not None and constraints_ref['bytes']!=len(c_bytes):
                     raise ValueError('cut_constraints_size_mismatch')
                 try:
-                    validate_snapshot_artifact(json.loads(c_bytes.decode()))
+                    c_artifact=json.loads(c_bytes.decode())
+                    validate_snapshot_artifact(c_artifact)
                 except (UnicodeDecodeError,json.JSONDecodeError,InvalidFeedback):
                     raise ValueError('invalid_cut_constraints_ref')
                 if snap_row is None:
@@ -646,7 +672,9 @@ class Files:
                 expected_rel=f"snapshots/{snap_row['source_sha256']}/{c_sha}.json"
                 if constraints_ref['path']!=expected_rel:
                     raise ValueError('invalid_cut_constraints_ref')
-                raw_params['cut_constraints_ref']={
+                if not snap_overrides:
+                    snap_overrides=(json.loads(snap_row['body']) or {}).get('parameter_overrides') or {}
+                verified_constraints_ref={
                     'storage_id':'processing',
                     'path':expected_rel,
                     'sha256':c_sha,
@@ -656,6 +684,24 @@ class Files:
                     req_caps.append('cut-constraints-v1')
                 if 'processing' not in req_storage:
                     req_storage.append('processing')
+            for pk,pv in snap_overrides.items():
+                if pk=='ai_tuning':
+                    if 'ai_tuning' in caller_params:
+                        if not isinstance(caller_params['ai_tuning'],dict):
+                            raise ValueError('invalid_ai_tuning')
+                        if isinstance(pv,dict):
+                            for sk,sv in pv.items():
+                                if sk in caller_params['ai_tuning'] and caller_params['ai_tuning'][sk]!=sv:
+                                    raise Conflict('parameter_override_mismatch')
+                elif pk in caller_params and caller_params[pk]!=pv:
+                    raise Conflict('parameter_override_mismatch')
+            merged_params=self._merge_task_parameters(inherited_params,caller_params,snap_overrides)
+            merged_params.pop('cut_constraints_ref',None)
+            raw_params=normalize_task_parameters(merged_params,ValueError,'invalid_parameters')
+            if verified_constraints_ref is not None:
+                raw_params['cut_constraints_ref']=verified_constraints_ref
+            if raw_params.get('processing_strategy')=='hybrid_ai_vision' and 'hybrid-ai-vision-v1' not in req_caps:
+                req_caps.append('hybrid-ai-vision-v1')
             if b.get('type')=='experiment' and not raw_params:
                 raise ValueError('experiment_requires_parameters')
             pub_policy=b.get('publication_policy','never')

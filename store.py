@@ -2,10 +2,12 @@
 import contextlib
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
 import uuid
+from feedback import AI_MODEL_RE, AI_PROVIDERS
 
 
 def uid():
@@ -65,6 +67,84 @@ def _opt_float(value, default=None):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError('invalid_external_timestamp')
     return float(value)
+
+
+_WORKER_MODEL_NAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+
+def _validate_worker_ai_fields(public, body):
+    """Validate and apply sanitized worker AI provider/model advertisement fields."""
+    if not any(k in body for k in ('ai_providers', 'ai_models', 'default_ai_model')):
+        return
+    if 'ai_providers' in body:
+        raw_providers = body['ai_providers']
+        if raw_providers is None:
+            providers = []
+        elif isinstance(raw_providers, list) and len(raw_providers) <= 20:
+            providers = []
+            for p in raw_providers:
+                if not isinstance(p, str) or p not in AI_PROVIDERS:
+                    raise ValueError('invalid_ai_providers')
+                if p not in providers:
+                    providers.append(p)
+        else:
+            raise ValueError('invalid_ai_providers')
+        public['ai_providers'] = providers
+    if 'ai_models' in body:
+        raw_models = body['ai_models']
+        if raw_models is None:
+            models = []
+        elif isinstance(raw_models, list) and len(raw_models) <= 50:
+            seen_ids = set()
+            models = []
+            allowed_providers = set(public.get('ai_providers') or []) if 'ai_providers' in body else None
+            for item in raw_models:
+                if not isinstance(item, dict):
+                    raise ValueError('invalid_ai_models')
+                provider = item.get('provider')
+                model_name = item.get('model')
+                ident = item.get('id')
+                label = item.get('label')
+                is_default = item.get('is_default', False)
+                if (
+                    not isinstance(provider, str)
+                    or provider not in AI_PROVIDERS
+                    or (allowed_providers is not None and provider not in allowed_providers)
+                    or not isinstance(model_name, str)
+                    or not _WORKER_MODEL_NAME_RE.fullmatch(model_name)
+                    or not isinstance(ident, str)
+                    or ident != f'{provider}:{model_name}'
+                    or not AI_MODEL_RE.fullmatch(ident)
+                    or ident in seen_ids
+                    or not isinstance(label, str)
+                    or '\r' in label
+                    or '\n' in label
+                    or not 1 <= len(label.strip()) <= 100
+                    or type(is_default) is not bool
+                ):
+                    raise ValueError('invalid_ai_models')
+                seen_ids.add(ident)
+                models.append({
+                    'id': ident,
+                    'provider': provider,
+                    'model': model_name,
+                    'label': label.strip(),
+                    'is_default': is_default,
+                })
+        else:
+            raise ValueError('invalid_ai_models')
+        public['ai_models'] = models
+        if 'ai_providers' not in body:
+            public['ai_providers'] = list(dict.fromkeys(m['provider'] for m in models))
+    model_ids = {m['id'] for m in (public.get('ai_models') or []) if isinstance(m, dict) and 'id' in m}
+    if 'default_ai_model' in body:
+        default_model = body['default_ai_model']
+        if default_model is not None:
+            if not isinstance(default_model, str) or not AI_MODEL_RE.fullmatch(default_model) or default_model not in model_ids:
+                raise ValueError('invalid_default_ai_model')
+        public['default_ai_model'] = default_model
+    elif 'ai_models' in body and public.get('default_ai_model') not in model_ids:
+        public['default_ai_model'] = next((m['id'] for m in public.get('ai_models') or [] if m.get('is_default')), None)
 
 
 def _sanitize_external_worker(raw, now):
@@ -229,7 +309,11 @@ class Store:
         existing_token = body.get('worker_token')
         if existing_id and existing_token and self.authenticate(existing_id, existing_token):
             refreshed = self.refresh_worker_profile(existing_id, body)
-            return {'worker_id': existing_id, 'worker_token': existing_token, 'heartbeat_seconds': 15, 'lease_seconds': 90, 'contract_version': 1, 'capabilities': refreshed['capabilities'], 'accessible_storage_ids': refreshed['accessible_storage_ids']}
+            out = {'worker_id': existing_id, 'worker_token': existing_token, 'heartbeat_seconds': 15, 'lease_seconds': 90, 'contract_version': 1, 'capabilities': refreshed['capabilities'], 'accessible_storage_ids': refreshed['accessible_storage_ids']}
+            for k in ('ai_providers', 'ai_models', 'default_ai_model'):
+                if k in refreshed:
+                    out[k] = refreshed[k]
+            return out
         token = secrets.token_urlsafe(32)
         identity = uid()
         public = {
@@ -241,6 +325,7 @@ class Store:
         }
         if body.get('runtime'):
             public['runtime'] = body['runtime']
+        _validate_worker_ai_fields(public, body)
         with self.tx() as db:
             db.execute('INSERT INTO workers(id,secret,body,seen) VALUES(?,?,?,?)', (identity, hashlib.sha256(token.encode()).hexdigest(), encode(public), self.clock()))
         return {'worker_id': identity, 'worker_token': token, 'heartbeat_seconds': 15, 'lease_seconds': 90, 'contract_version': 1}
@@ -264,6 +349,7 @@ class Store:
                 if body['runtime'] is not None and not isinstance(body['runtime'], dict):
                     raise ValueError('invalid_runtime')
                 public['runtime'] = body['runtime']
+            _validate_worker_ai_fields(public, body)
             seq = max(row['sequence'] + 1, body['sequence']) if type(body.get('sequence')) is int else row['sequence'] + 1
             now = self.clock()
             db.execute('UPDATE workers SET body=?,seen=?,sequence=? WHERE id=?', (encode(public), now, seq, identity))
@@ -541,18 +627,32 @@ class Store:
             rows=db.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY json_extract(body,'$.priority') DESC,created,id").fetchall()
             for task in rows:
                 spec=json.loads(task['body'])
+                params=spec.get('parameters') or {}
+                strategy=params.get('processing_strategy','vision_only')
+                if strategy=='ai_only':
+                    continue
                 source=json.loads(db.execute('SELECT body FROM sources WHERE id=?',(task['source_id'],)).fetchone()['body'])
                 if spec.get('runtime_requirements') and any(caps.get('runtime',{}).get(k)!=v for k,v in spec['runtime_requirements'].items()): continue
                 req_caps=set(spec.get('required_capabilities') or [])
                 req_caps.add(spec.get('executor','process-v2'))
-                if (spec.get('parameters') or {}).get('cut_constraints_ref'):
+                if params.get('cut_constraints_ref'):
                     req_caps.add('cut-constraints-v1')
+                if strategy=='hybrid_ai_vision':
+                    req_caps.add('hybrid-ai-vision-v1')
                 req_storage=set(spec.get('required_storage_ids') or [])
                 req_storage.add(source['storage_id'])
-                if spec.get('type')!='dryrun' or (spec.get('parameters') or {}).get('cut_constraints_ref'):
+                if spec.get('type')!='dryrun' or params.get('cut_constraints_ref'):
                     req_storage.add('processing')
                 if not req_caps.issubset(worker_caps) or not req_storage.issubset(worker_storage):
                     continue
+                if strategy=='hybrid_ai_vision':
+                    worker_model_ids={m['id'] for m in (caps.get('ai_models') or []) if isinstance(m,dict) and 'id' in m}
+                    if not worker_model_ids:
+                        continue
+                    if params.get('allow_model_fallback',True) is False:
+                        req_model=params.get('ai_model','auto')
+                        if req_model!='auto' and req_model not in worker_model_ids:
+                            continue
                 if caps.get('runtime') and not spec.get('runtime_requirements'):
                     spec['runtime_requirements']={k:v for k,v in caps['runtime'].items() if k in ('executor_version','build_digest','model_sha256')}
                     db.execute('UPDATE tasks SET body=? WHERE id=?',(encode(spec),task['id']))
@@ -591,6 +691,7 @@ class Store:
                             raise ValueError('invalid_'+key)
                         public[key]=body[key]
                 if body.get('runtime'): public['runtime']=body['runtime']
+                _validate_worker_ai_fields(public, body)
                 public['snapshot']={k:body[k] for k in ('stage','progress','last_progress_at') if k in body}
                 public['snapshot']['local_state']={k:body.get('local_state',{}).get(k) for k in ('task_id','attempt_id','acknowledged_sequence')}
                 db.execute('UPDATE workers SET body=?,seen=?,sequence=? WHERE id=?',(encode(public),self.clock(),body['sequence'],worker))
@@ -673,6 +774,32 @@ class Store:
     def workers(self):
         with self.tx() as db:
             return [dict(json.loads(r['body']),id=r['id'],last_seen=r['seen'],online=self.clock()-r['seen']<90,paused=bool(r['paused']),version=r['sequence']) for r in db.execute('SELECT * FROM workers ORDER BY seen DESC')]
+
+    def available_ai_models(self):
+        """Aggregate deduplicated AI models advertised across registered video workers."""
+        catalog = {}
+        for w in self.workers():
+            online = bool(w.get('online'))
+            for item in (w.get('ai_models') or []):
+                if not isinstance(item, dict) or not item.get('id'):
+                    continue
+                ident = item['id']
+                entry = catalog.get(ident)
+                if entry is None:
+                    entry = {
+                        'id': ident,
+                        'provider': item.get('provider'),
+                        'model': item.get('model'),
+                        'label': item.get('label') or ident,
+                        'worker_ids': [],
+                        'online_worker_count': 0,
+                    }
+                    catalog[ident] = entry
+                if w['id'] not in entry['worker_ids']:
+                    entry['worker_ids'].append(w['id'])
+                    if online:
+                        entry['online_worker_count'] += 1
+        return sorted(catalog.values(), key=lambda m: (str(m.get('provider') or ''), str(m.get('id') or '')))
 
     def sync_external(self, domain, workers=None, tasks=None, deleted=None, snapshot=False, complete=True):
         """Upsert or replace a sanitized external worker/task snapshot for one domain."""
